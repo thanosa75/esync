@@ -31,13 +31,61 @@ normal case: decide is fast metadata work, fetch is the slow I/O-bound part) —
 with no error surfaced, so the bug only showed up as "the tuner never ramps"
 under a real timed transfer, never in a build/vet/pure-unit-test pass.
 
+MFR-0003 · receiver/run · Start the `--drain-timeout` (E9002) watchdog only
+once termination is *reachable* (`decideWg.Wait()` + `q.close()` +
+`q.waitDrained()` — every group decided, need queue empty), never from when
+the fetch pipeline is first launched — mirror `sender/state.go`'s
+`tracker.wait`, which correctly waits unbounded on `allDecidedCh` before
+arming `drainTimeout` around `doneCh`. Arming it at pipeline start makes
+`DrainTimeout` (default 60s) a cap on the *whole transfer*, not on the tail
+described by ARCHITECTURE §13.7 ("once reachable, terminate within
+drain-timeout") — any real transfer whose fetch phase runs past 60s (trivial
+on a multi-GB tree) hits `E9002 await SESSION_SUMMARY` mid-transfer and gets
+killed, even though it was still making steady progress (confirmed from a
+real 43GB/176k-file run: `group.decide` spans kept completing for ~60s after
+the watchdog fired). Once the root context is cancelled for some other
+reason, `workerStopGrace` still bounds how long Run waits for the
+decide/fetch goroutines to unwind — see `waitGrace`.
+
 <!--
-MFR-0003 · <area> · <the rule, imperative> — <why: the bug it prevents>
+MFR-0004 · <area> · <the rule, imperative> — <why: the bug it prevents>
 -->
 
 ---
 
 ## Session Log
+
+### 2026-09-07 — Fix: receiver drain watchdog fires mid-transfer (E9002)
+
+- Diagnosed from a real sender/receiver log pair the user pasted: a
+  43GB/176k-file resume (34k files / 4GB actually needed) died with
+  `E9002 await SESSION_SUMMARY` at 2m12s despite `group.decide` spans still
+  completing right up to the failure — i.e. it was progressing, not stuck.
+  Root cause: `receiver/run.go`'s pipeline-drain `select` armed
+  `cfg.DrainTimeout + workerStopGrace` (65s) from the moment the fetch
+  pipeline was launched, not from when termination became *reachable*
+  (§13.7). A 4GB fetch phase at the observed ~40-60Mbps/channel goodput
+  routinely exceeds 60s, so the watchdog was firing on essentially every
+  transfer of this size, independent of real health. See MFR-0003.
+- Fix: split the single `select` into two phases mirroring
+  `sender/state.go`'s `tracker.wait` — wait unbounded (only cancellable by
+  `rootCtx`, graced by `workerStopGrace` once cancelled) for `reachable`
+  (`decideWg.Wait()`/`q.close()`/`q.waitDrained()`, i.e. `pipelineDone`);
+  only then arm `cfg.DrainTimeout` around `s.chWg.Wait()` (`done`), raising
+  the fatal `E9002` itself on that specific timeout (previously the single
+  select only logged a non-fatal WARN and fell through, and the real E9002
+  came from a second, equally mistimed `DrainTimeout` wait on
+  `SESSION_SUMMARY` in step 11). New `waitGrace` helper factors the
+  post-cancellation bounded-wait-with-warning used in both phases.
+- Full gate green: `gofmt -l .` clean, `go vet ./...` clean,
+  `go test -race ./...` all packages, `internal/receiver` coverage 81.9%
+  (min 80%).
+- No test added that reproduces the exact multi-GB-fetch-past-60s timing
+  (would need a paced fake sender run past `DrainTimeout`, similar to
+  `tune_test.go`'s `TestRunAdaptiveRampUp` pattern) — flagged as a follow-up
+  if this area gets touched again; the fix here is structural (same
+  before/after control flow the existing `-race` suite already exercises)
+  rather than behavior only a new timing test would catch.
 
 ### 2026-09-04 — Adaptive channel tuner (REQ-PAR-004) + sender-side dynamic join
 

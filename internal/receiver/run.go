@@ -249,6 +249,17 @@ func (s *session) channelCount() int {
 	return len(s.workers)
 }
 
+// waitGrace blocks on ch for up to d longer, warning if it never fires —
+// bounding how long Run waits for a goroutine to unwind once the root
+// context has already been cancelled (workerStopGrace).
+func waitGrace(ctx obs.Ctx, ch <-chan struct{}, d time.Duration) {
+	select {
+	case <-ch:
+	case <-time.After(d):
+		obs.Warn(ctx, "pipeline did not drain in time")
+	}
+}
+
 // Run executes the receiver side of one session (ARCHITECTURE §4.2) and returns
 // the receiver's own Summary and the process exit code (§14.6).
 func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
@@ -573,6 +584,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	}
 
 	done := make(chan struct{})
+	reachable := make(chan struct{})
 	obs.Go(octx, "pipeline.wait", func() error {
 		decideWg.Wait()
 		q.close()
@@ -587,15 +599,32 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		s.chMu.Lock()
 		s.pipelineDone = true
 		s.chMu.Unlock()
+		close(reachable)
 		s.chWg.Wait()
 		close(done)
 		return nil
 	})
 
+	// The drain watchdog (§13.7) bounds only the tail: once termination is
+	// reachable (every group decided, need queue empty), every issued
+	// request_id terminating within DrainTimeout is required, or it's a fatal
+	// accounting defect (E9002). Reaching "reachable" is real transfer time
+	// and is not itself bounded by DrainTimeout — only once the root context
+	// is separately cancelled (signal, another fatal error) does
+	// workerStopGrace bound how long Run waits for the decide/fetch
+	// goroutines to unwind.
 	select {
-	case <-done:
-	case <-time.After(cfg.DrainTimeout + workerStopGrace):
-		obs.Warn(ctx, "pipeline did not drain in time")
+	case <-reachable:
+		select {
+		case <-done:
+		case <-time.After(cfg.DrainTimeout):
+			s.fail(fault.New(fault.E9002, "drain watchdog", "", nil))
+			waitGrace(ctx, done, workerStopGrace)
+		case <-rootCtx.Done():
+			waitGrace(ctx, done, workerStopGrace)
+		}
+	case <-rootCtx.Done():
+		waitGrace(ctx, reachable, workerStopGrace)
 	}
 
 	if s.err() != nil {
