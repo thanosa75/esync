@@ -227,6 +227,49 @@ func TestTrackerTerminationCondition(t *testing.T) {
 	}
 }
 
+// The receiver sends GROUP_DECISION at the head of its decision pass, before it
+// enqueues that group's needed files and long before it requests them, so
+// "every group decided" can precede the last FILE_REQUEST by far more than
+// --drain-timeout. A session that is still moving must not trip the watchdog,
+// however long the tail runs.
+func TestTrackerDrainWatchdogIgnoresLiveTransfer(t *testing.T) {
+	tr := newTracker(1)
+	if err := tr.decision(&wire.GroupDecision{GroupID: 0, Needed: []uint16{0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	const drain = 50 * time.Millisecond
+	go func() {
+		// Work spanning many drain windows, each with steady chunk activity.
+		tr.reqStarted(1, 0)
+		for i := 0; i < 40; i++ {
+			time.Sleep(drain / 5)
+			tr.bump() // one streamed chunk
+		}
+		tr.reqCompleted(1, 0, 1024)
+		tr.reqStarted(2, 1)
+		tr.reqCompleted(2, 1, 1024)
+	}()
+
+	if err := tr.wait(context.Background(), drain); err != nil {
+		t.Fatalf("watchdog tripped on a live transfer: %v", err)
+	}
+}
+
+// ...but a session that stops moving with work outstanding still trips it: that
+// is the accounting defect E9002 exists to catch.
+func TestTrackerDrainWatchdogTripsOnStall(t *testing.T) {
+	tr := newTracker(1)
+	if err := tr.decision(&wire.GroupDecision{GroupID: 0, Needed: []uint16{0}}); err != nil {
+		t.Fatal(err)
+	}
+	tr.reqStarted(1, 0) // in flight, and then nothing ever happens again
+
+	if err := tr.wait(context.Background(), 30*time.Millisecond); fault.GetCode(err) != fault.E9002 {
+		t.Fatalf("a stalled session should trip the watchdog, got %v", err)
+	}
+}
+
 // inProgressGroups reports only decided groups with an unresolved needed
 // file, and drops a group once every needed file is resolved.
 func TestTrackerInProgressGroups(t *testing.T) {

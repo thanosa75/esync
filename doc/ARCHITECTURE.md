@@ -1263,9 +1263,22 @@ ascending so that progress is monotonic and comprehensible.
 
 The session is complete when: `groups_decided == total_groups` **and** the need queue is empty
 **and** every issued `request_id` has terminated (`INV-7`). Only then does the sender send
-`SESSION_SUMMARY`. A watchdog asserts that this condition, once reachable, is reached within
-`--drain-timeout` (default 60 s); exceeding it is `E9002` (an internal accounting bug) and is fatal
-rather than a hang (`REQ-NET-010`).
+`SESSION_SUMMARY`. A watchdog asserts that the condition is reached, and exceeding it is `E9002` (an
+internal accounting bug), fatal rather than a hang (`REQ-NET-010`).
+
+The two sides arm that watchdog differently, because only the receiver knows when termination has
+become *reachable*. The receiver does: it waits for its decide pool to finish **and** its need queue
+to drain (no queued items, none in flight), and from that point `--drain-timeout` (default 60 s)
+bounds the remaining channel unwind.
+
+The sender does not. It never learns when the receiver has stopped issuing `FILE_REQUEST`s — there
+is no such R→S message — and `groups_decided == total_groups` is **not** a usable proxy for it: the
+receiver emits `GROUP_DECISION` at the head of its decision pass, before that group's needed files
+are enqueued and long before they are requested, so under backpressure the last decision can precede
+the last request by many minutes. Arming a deadline there aborts healthy transfers. The sender's
+watchdog therefore bounds **inactivity** rather than the tail's duration: once every group is
+decided, `E9002` fires only after a full `--drain-timeout` in which no request started, ended, or
+streamed a chunk. A live session is never interrupted; a genuinely stuck one still fails fast.
 
 ---
 

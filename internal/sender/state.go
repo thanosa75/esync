@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"esync/internal/fault"
@@ -106,6 +107,11 @@ type tracker struct {
 	doneCh       chan struct{}
 	decidedDone  bool
 	doneClosed   bool
+
+	// progress is a monotonic "the session is still moving" counter, bumped by
+	// every request lifecycle event and every streamed chunk. The drain watchdog
+	// samples it rather than the clock (see wait).
+	progress atomic.Uint64
 }
 
 func newTracker(totalGroups int) *tracker {
@@ -165,11 +171,17 @@ func (t *tracker) decision(m *wire.GroupDecision) error {
 	return nil
 }
 
+// bump records session activity for the drain watchdog. It is called on every
+// request lifecycle event and once per streamed chunk, so a single long file
+// still counts as progress while its bytes are moving.
+func (t *tracker) bump() { t.progress.Add(1) }
+
 func (t *tracker) reqStarted(reqID, fileID uint64) {
 	t.mu.Lock()
 	t.reqToFile[reqID] = fileID
 	t.inflight++
 	t.mu.Unlock()
+	t.bump()
 }
 
 func (t *tracker) reqCompleted(reqID, fileID uint64, bytesSent uint64) {
@@ -182,6 +194,7 @@ func (t *tracker) reqCompleted(reqID, fileID uint64, bytesSent uint64) {
 	}
 	t.reevalLocked()
 	t.mu.Unlock()
+	t.bump()
 }
 
 // reqFailed ends a request. resolve is true for a permanent failure (the file
@@ -196,6 +209,7 @@ func (t *tracker) reqFailed(reqID uint64, resolve, permanent bool) {
 	}
 	t.reevalLocked()
 	t.mu.Unlock()
+	t.bump()
 }
 
 func (t *tracker) reqCancelled(reqID uint64) {
@@ -203,6 +217,7 @@ func (t *tracker) reqCancelled(reqID uint64) {
 	t.finishLocked(reqID, true)
 	t.reevalLocked()
 	t.mu.Unlock()
+	t.bump()
 }
 
 func (t *tracker) finishLocked(reqID uint64, resolve bool) {
@@ -219,6 +234,15 @@ func (t *tracker) finishLocked(reqID uint64, resolve bool) {
 
 // wait blocks until termination, ctx cancellation, or — once every group is
 // decided — the drain watchdog (E9002).
+//
+// Every group being decided is not the moment termination becomes *reachable*
+// (§13.7): the receiver sends GROUP_DECISION at the head of its decision pass,
+// before it enqueues that group's needed files and long before it requests
+// them, so a backlogged receiver can still hold thousands of unrequested files
+// when the last decision lands. Bounding the tail's total duration from here
+// aborts healthy transfers. The watchdog therefore bounds *inactivity*: E9002
+// means the session has stopped moving with work outstanding, and any request
+// event or streamed chunk is proof that it has not.
 func (t *tracker) wait(ctx context.Context, drainTimeout time.Duration) error {
 	select {
 	case <-t.doneCh:
@@ -227,13 +251,20 @@ func (t *tracker) wait(ctx context.Context, drainTimeout time.Duration) error {
 		return ctx.Err()
 	case <-t.allDecidedCh:
 	}
-	select {
-	case <-t.doneCh:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(drainTimeout):
-		return fault.New(fault.E9002, "drain watchdog", "", nil)
+	last := t.progress.Load()
+	for {
+		select {
+		case <-t.doneCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(drainTimeout):
+			cur := t.progress.Load()
+			if cur == last {
+				return fault.New(fault.E9002, "drain watchdog", "", nil)
+			}
+			last = cur
+		}
 	}
 }
 

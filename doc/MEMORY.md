@@ -34,9 +34,10 @@ under a real timed transfer, never in a build/vet/pure-unit-test pass.
 MFR-0003 · receiver/run · Start the `--drain-timeout` (E9002) watchdog only
 once termination is *reachable* (`decideWg.Wait()` + `q.close()` +
 `q.waitDrained()` — every group decided, need queue empty), never from when
-the fetch pipeline is first launched — mirror `sender/state.go`'s
-`tracker.wait`, which correctly waits unbounded on `allDecidedCh` before
-arming `drainTimeout` around `doneCh`. Arming it at pipeline start makes
+the fetch pipeline is first launched. (Originally this rule cited
+`sender/state.go`'s `tracker.wait` as the model to mirror; that was wrong —
+the sender cannot compute reachability at all. See MFR-0004.) Arming it at
+pipeline start makes
 `DrainTimeout` (default 60s) a cap on the *whole transfer*, not on the tail
 described by ARCHITECTURE §13.7 ("once reachable, terminate within
 drain-timeout") — any real transfer whose fetch phase runs past 60s (trivial
@@ -47,13 +48,70 @@ the watchdog fired). Once the root context is cancelled for some other
 reason, `workerStopGrace` still bounds how long Run waits for the
 decide/fetch goroutines to unwind — see `waitGrace`.
 
+MFR-0004 · sender/state · Never treat `groups_decided == total_groups` as the
+moment the sender's termination becomes *reachable*, and never arm a deadline
+on it. The receiver sends `GROUP_DECISION` at the head of `decideGroup`,
+*before* the `pushGroup` backpressure point and long before those files are
+requested — so under load the last decision can precede the last
+`FILE_REQUEST` by many minutes (observed: ~20 min, with `group.decide` spans
+of 1.1–1.4e6 ms for groups 53/56/84/186 sitting blocked in `pushGroup`). The
+sender has no signal for "the receiver will issue no more requests" — there is
+no such R→S message in §9.2 — so `tracker.wait` bounds *inactivity* instead:
+after `allDecidedCh` it samples the monotonic `tracker.progress` counter
+(bumped by `reqStarted`/`reqCompleted`/`reqFailed`/`reqCancelled` and once per
+streamed chunk in `serve`) and fires E9002 only after a whole `--drain-timeout`
+with no movement. Bumping per *chunk* matters as much as per request: a single
+large file in the tail streams for minutes with no request-level event, and a
+request-only counter would kill it. The pre-fix deadline killed a healthy
+43GB/176k-file run at exactly 60s after the final decision burst (13GB of 43GB
+transferred, sender E9002 at 14:44:10 vs last decisions at 14:43:12), which
+the operator saw as "an accounting defect; report with the log" — E9002 must
+mean *stalled*, never merely *slow*.
+
 <!--
-MFR-0004 · <area> · <the rule, imperative> — <why: the bug it prevents>
+MFR-0005 · <area> · <the rule, imperative> — <why: the bug it prevents>
 -->
 
 ---
 
 ## Session Log
+
+### 2026-09-07 — sender E9002 drain watchdog: deadline → inactivity
+
+- User brought logs from a 43GB/176k-file run that died with `E9002 drain
+  watchdog` on the sender ("an accounting defect; report with the log"), only
+  13GB transferred, "not all groups were transferred". Asked for the
+  highest-ROI fix.
+- Diagnosis: **false positive**, not an accounting leak. The `needed`/`resolved`
+  bookkeeping was correct; the *arming condition* was wrong. `tracker.wait`
+  started the 60s timer on `allDecidedCh` (`groups_decided == total_groups`),
+  but the receiver sends `GROUP_DECISION` at the head of `decideGroup`
+  (`decide.go:250`), before the `pushGroup` backpressure point (`:281`).
+  Under load decide ran ~20 min ahead of fetch — four decide workers blocked
+  inside `pushGroup` (spans `group=53` 1.16e6 ms, `84` 1.21e6, `56` 1.42e6,
+  `186` 2.8e5, all `outcome=ok`). Sender saw all 204 decisions at ~14:43:12,
+  armed 60s, expired 14:44:10 while the receiver was still fetching 4096
+  freshly-enqueued files. Receiver's `E3005 EOF` was downstream fallout of the
+  sender's teardown; the E7011 absolute-symlink rejections were unrelated.
+- This is the sender-side sibling of MFR-0003 (receiver side, fixed earlier
+  from the *same* logs). MFR-0003 cited `sender/state.go` as the correct
+  model — amended, since the sender cannot compute reachability at all.
+- Fix (MFR-0004): `tracker.progress atomic.Uint64`, bumped by the four request
+  lifecycle methods and once per streamed chunk in `serve`; `tracker.wait`
+  loops sampling it and fires E9002 only after a full `--drain-timeout` with
+  zero movement. No wire change, no receiver change, no protocol version bump
+  — chosen over adding an R→S "no more requests" message (correct but touches
+  the wire format) and over gating on CREDIT count (shrinks the window but
+  still breaks on a large tail). ARCHITECTURE §13.7 rewritten to state the two
+  sides' differing arming rules.
+- Tests: `TestTrackerDrainWatchdogIgnoresLiveTransfer` (work spanning 8 drain
+  windows must not trip — fails deterministically pre-fix with the user's exact
+  error) and `TestTrackerDrainWatchdogTripsOnStall` (in-flight request, then
+  silence, still trips — the watchdog is not defanged).
+- Noticed, not changed (Rule 3): the sender's `drain` span in `run.go:349`
+  starts before `tr.wait` blocks on `allDecidedCh`, so it bills the entire
+  transfer to "drain" (`dur_ms=1.6e6` in the report) — misleading name, worth
+  splitting into `transfer` + `drain` in a future pass.
 
 ### 2026-09-07 — 60s groups/channels/bandwidth heartbeat
 
