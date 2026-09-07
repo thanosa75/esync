@@ -16,8 +16,9 @@ curl -fsSL https://raw.githubusercontent.com/thanosa75/esync/main/scripts/instal
 ```
 
 Downloads the latest build for your platform (`linux/amd64`, `darwin/arm64`),
-verifies its SHA-256, and installs it to `/usr/local/bin/esync`. Override with
-`ESYNC_BIN_DIR` (install location) or `ESYNC_VERSION` (release tag):
+verifies its SHA-256, and installs it to `~/.local/bin` when that's on your
+`PATH` (no sudo), otherwise `/usr/local/bin`. Override with `ESYNC_BIN_DIR`
+(install location) or `ESYNC_VERSION` (release tag):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/thanosa75/esync/main/scripts/install.sh | ESYNC_BIN_DIR="$HOME/.local/bin" sh

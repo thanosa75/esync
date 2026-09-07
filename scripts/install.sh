@@ -5,14 +5,31 @@
 #
 # Env overrides:
 #   ESYNC_VERSION   release tag to fetch          (default: latest)
-#   ESYNC_BIN_DIR   install directory             (default: /usr/local/bin)
+#   ESYNC_BIN_DIR   install directory             (default: ~/.local/bin if on
+#                                                  PATH, else /usr/local/bin)
 set -eu
 
 REPO="thanosa75/esync"
 TAG="${ESYNC_VERSION:-latest}"
-BIN_DIR="${ESYNC_BIN_DIR:-/usr/local/bin}"
 
 die() { echo "esync: $*" >&2; exit 1; }
+
+# on_path reports whether $1 is a component of $PATH.
+on_path() {
+	case ":${PATH}:" in
+		*":$1:"*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+if [ -n "${ESYNC_BIN_DIR:-}" ]; then
+	BIN_DIR="$ESYNC_BIN_DIR"
+elif [ -n "${HOME:-}" ] && on_path "$HOME/.local/bin"; then
+	# Prefer a user-writable dir already on PATH — no sudo needed.
+	BIN_DIR="$HOME/.local/bin"
+else
+	BIN_DIR="/usr/local/bin"
+fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
