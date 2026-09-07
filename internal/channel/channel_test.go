@@ -80,7 +80,7 @@ func connPair(t *testing.T, id uint8) (senderConn, receiverConn *Conn) {
 func TestChannelRoundTrip(t *testing.T) {
 	snd, rcv := connPair(t, ControlChannelID)
 
-	want := &wire.SessionParams{RootName: "photos", SourceKind: 0, GroupSize: 1024, SenderVersion: "test"}
+	want := &wire.SessionParams{RootName: "photos", SourceKind: 0, GroupBytes: 512 << 20, SenderVersion: "test"}
 	if err := snd.SendMsg(want); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -196,6 +196,27 @@ func TestDialTotalFailureErrorTable(t *testing.T) {
 	rendered := FormatEndpointErrs(tab)
 	if !strings.Contains(rendered, "127.0.0.1") {
 		t.Fatalf("rendered table missing endpoint: %q", rendered)
+	}
+}
+
+// T-CHAN: RecvMsgTimeout bounds a single blocking receive on a data channel and
+// surfaces expiry as E3005; a message that arrives in time still round-trips.
+func TestRecvMsgTimeout(t *testing.T) {
+	snd, rcv := connPair(t, 1)
+
+	if _, err := rcv.RecvMsgTimeout(80 * time.Millisecond); fault.GetCode(err) != fault.E3005 {
+		t.Fatalf("idle recv: code = %v, want E3005", fault.GetCode(err))
+	}
+
+	if err := snd.SendMsg(&wire.FileChunk{RequestID: 7, Offset: 0, Data: []byte("ok")}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := rcv.RecvMsgTimeout(time.Second)
+	if err != nil {
+		t.Fatalf("timed recv after send: %v", err)
+	}
+	if c, ok := m.(*wire.FileChunk); !ok || c.RequestID != 7 {
+		t.Fatalf("round-trip mismatch: %#v", m)
 	}
 }
 

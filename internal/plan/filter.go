@@ -20,6 +20,10 @@ type Options struct {
 	KeepSystemFiles bool
 	// Filters are the ordered --include/--exclude rules; last match wins.
 	Filters []FilterRule
+	// GroupBytes is the target group size in bytes (--group-bytes); <= 0 uses the
+	// default. It does not enter the manifest digest, so retuning it does not
+	// invalidate a resume journal.
+	GroupBytes int64
 }
 
 // FilterSignature is the canonical string that enters the manifest digest

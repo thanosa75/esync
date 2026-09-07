@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"os"
 	"slices"
+	"sort"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
@@ -58,10 +59,15 @@ type Entry struct {
 }
 
 const (
-	groupSize       = 1024
-	protocolVersion = 1
-	hashAlg         = "md5"
-	sysExcludeTag   = "sys-v1"
+	// maxGroupEntries is the hard per-group entry cap (§10.4); it also matches the
+	// wire GROUP_MANIFEST entry_count ceiling.
+	maxGroupEntries = 1024
+	// defaultGroupBytes is the target group size when --group-bytes is unset: a
+	// group is packed with plan entries until their file bytes reach this figure.
+	defaultGroupBytes = 512 << 20
+	protocolVersion   = 2
+	hashAlg           = "md5"
+	sysExcludeTag     = "sys-v1"
 
 	// spillThreshold is §10.3 / --spill-threshold. For the vertical slice the
 	// external merge sort is a documented follow-up (B-MEM-01); above the
@@ -82,6 +88,7 @@ type Plan struct {
 	entries       []Entry
 	keys          [][]byte
 	idByKey       map[string]uint64
+	groupStart    []int // ascending group start indices + a trailing len(entries)
 	exclusions    []Exclusion
 	filterSig     string
 	digest        [32]byte
@@ -163,8 +170,45 @@ func Build(entries []Entry, opts Options) (*Plan, error) {
 			p.TotalBytes += uint64(k.e.Size)
 		}
 	}
+	p.groupStart = computeGroups(p.entries, groupTarget(opts.GroupBytes))
 	p.digest = computeDigest(p.entries, p.keys, p.filterSig)
 	return p, nil
+}
+
+func groupTarget(n int64) int64 {
+	if n <= 0 {
+		return defaultGroupBytes
+	}
+	return n
+}
+
+// computeGroups returns the ascending start index of each group followed by a
+// trailing len(entries) sentinel, so group i spans entries[start[i]:start[i+1]]
+// (§10.4). A group is closed before an entry once it already holds
+// maxGroupEntries entries or once adding that entry's file bytes would take the
+// group past target — so a single oversize file forms its own group. Only
+// regular-file sizes count toward the byte target; dirs and symlinks still take
+// an id slot but contribute nothing. An empty plan has no groups.
+func computeGroups(entries []Entry, target int64) []int {
+	if len(entries) == 0 {
+		return []int{0}
+	}
+	starts := []int{0}
+	var acc int64
+	count := 0
+	for i := range entries {
+		var sz int64
+		if entries[i].Type == TypeFile {
+			sz = entries[i].Size
+		}
+		if count > 0 && (count >= maxGroupEntries || acc+sz > target) {
+			starts = append(starts, i)
+			acc, count = 0, 0
+		}
+		acc += sz
+		count++
+	}
+	return append(starts, len(entries))
 }
 
 // orderingKey is key(entry) from §10.2: the '/'-separated path, NFC-normalised
@@ -213,7 +257,7 @@ func computeDigest(entries []Entry, keys [][]byte, filterSig string) [32]byte {
 	binary.BigEndian.PutUint16(n[:2], protocolVersion)
 	h.Write(n[:2])
 	h.Write([]byte(hashAlg))
-	binary.BigEndian.PutUint32(n[:4], groupSize)
+	binary.BigEndian.PutUint32(n[:4], 0) // was group_size; grouping is now size-based (§10.4)
 	h.Write(n[:4])
 	binary.BigEndian.PutUint32(n[:4], 0) // reserved plan flags
 	h.Write(n[:4])
@@ -243,16 +287,16 @@ func computeDigest(entries []Entry, keys [][]byte, filterSig string) [32]byte {
 func (p *Plan) Entries() []Entry { return p.entries }
 
 // NumGroups is the number of groups; an empty plan has zero (§10.4).
-func (p *Plan) NumGroups() int { return (len(p.entries) + groupSize - 1) / groupSize }
+func (p *Plan) NumGroups() int {
+	if len(p.groupStart) < 2 {
+		return 0
+	}
+	return len(p.groupStart) - 1
+}
 
 // Group returns the entries of group i (a contiguous file-id range).
 func (p *Plan) Group(i int) []Entry {
-	lo := i * groupSize
-	hi := lo + groupSize
-	if hi > len(p.entries) {
-		hi = len(p.entries)
-	}
-	return p.entries[lo:hi]
+	return p.entries[p.groupStart[i]:p.groupStart[i+1]]
 }
 
 // Groups returns every group in order.
@@ -264,6 +308,19 @@ func (p *Plan) Groups() [][]Entry {
 	return gs
 }
 
+// GroupFirstID is the file id of group i's first entry — the value the sender
+// writes as GROUP_MANIFEST.first_file_id (§10.4).
+func (p *Plan) GroupFirstID(i int) uint64 { return uint64(p.groupStart[i]) }
+
+// GroupFirsts lists every group's first file id, in group order.
+func (p *Plan) GroupFirsts() []uint64 {
+	out := make([]uint64, p.NumGroups())
+	for i := range out {
+		out[i] = uint64(p.groupStart[i])
+	}
+	return out
+}
+
 // FileID maps a source-relative '/'-path to its file id. The lookup normalises
 // the argument with the §10.2 key rule.
 func (p *Plan) FileID(relSlashPath string) (uint64, bool) {
@@ -272,8 +329,12 @@ func (p *Plan) FileID(relSlashPath string) (uint64, bool) {
 	return id, ok
 }
 
-// GroupID returns file_id / 1024 (§10.4).
-func GroupID(fileID uint64) uint64 { return fileID / groupSize }
+// GroupID returns the id of the group that owns fileID (§10.4).
+func (p *Plan) GroupID(fileID uint64) uint64 {
+	return uint64(sort.Search(p.NumGroups(), func(k int) bool {
+		return uint64(p.groupStart[k+1]) > fileID
+	}))
+}
 
 // ManifestDigest is the §10.5 fingerprint of the plan (not of content).
 func (p *Plan) ManifestDigest() [32]byte { return p.digest }

@@ -162,6 +162,27 @@ func (c *Conn) RecvMsg() (wire.Message, error) {
 	}
 }
 
+// RecvMsgTimeout is RecvMsg with a hard ceiling on how long a single receive may
+// block. On expiry it returns E3005 and the stream position is indeterminate, so
+// the caller must treat the Conn as dead. It is meant for data channels, which
+// carry no keepalive; do not use it on the control channel (whose RecvMsg the
+// keepalive watchdog already bounds).
+func (c *Conn) RecvMsgTimeout(d time.Duration) (wire.Message, error) {
+	if d <= 0 {
+		return c.RecvMsg()
+	}
+	_ = c.nc.SetReadDeadline(time.Now().Add(d))
+	defer func() { _ = c.nc.SetReadDeadline(time.Time{}) }()
+	m, err := c.RecvMsg()
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, fault.New(fault.E3005, "data channel idle past the stall timeout", "", err)
+		}
+	}
+	return m, err
+}
+
 // SetKeepaliveTimings overrides the ping interval and dead-peer deadline for
 // this Conn. Call before EnableKeepalive.
 func (c *Conn) SetKeepaliveTimings(interval, deadline time.Duration) {

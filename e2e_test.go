@@ -76,12 +76,13 @@ func TestE2ETransfer(t *testing.T) {
 	senderDone := make(chan result, 1)
 	go func() {
 		sum, code := sender.Run(sctx, sender.Config{
-			SourcePath:      src,
-			Version:         "e2e",
-			MaxChannels:     4,
-			PairTimeout:     30 * time.Second,
-			MaxPairAttempts: 5,
-			DrainTimeout:    30 * time.Second,
+			SourcePath:       src,
+			Version:          "e2e",
+			MaxChannels:      4,
+			PairTimeout:      30 * time.Second,
+			MaxPairAttempts:  5,
+			DrainTimeout:     30 * time.Second,
+			ProgressInterval: 10 * time.Millisecond,
 		})
 		senderDone <- result{sum, code}
 	}()
@@ -97,13 +98,14 @@ func TestE2ETransfer(t *testing.T) {
 	}
 
 	recvSum, recvCode := receiver.Run(rctx, receiver.Config{
-		Link:          code,
-		Dest:          dst,
-		Version:       "e2e",
-		Channels:      3,
-		GroupCredit:   4,
-		PipelineDepth: 2,
-		DrainTimeout:  30 * time.Second,
+		Link:             code,
+		Dest:             dst,
+		Version:          "e2e",
+		Channels:         3,
+		GroupCredit:      4,
+		PipelineDepth:    2,
+		DrainTimeout:     30 * time.Second,
+		ProgressInterval: 10 * time.Millisecond,
 	})
 	if recvCode != 0 {
 		t.Fatalf("receiver exit %d (outcome %q, resume %q)", recvCode, recvSum.Outcome, recvSum.ResumeCommand)

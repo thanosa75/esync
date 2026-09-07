@@ -39,6 +39,12 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 			fatal.CompareAndSwap(nil, err)
 		}
 	}
+	// ctrl is assigned once the control channel is up (step 4); finish reads it
+	// to tell the receiver *why* the session is ending. Without this the receiver
+	// only sees the control connection close and cannot tell an abort from a
+	// clean shutdown.
+	var ctrl *channel.Conn
+	var errNotified bool
 	finish := func(sum Summary) (Summary, int) {
 		var ferr error
 		if v := fatal.Load(); v != nil {
@@ -48,6 +54,16 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		switch {
 		case ferr != nil:
 			exit, outcome = fault.ExitCode(ferr), "error"
+			if ctrl != nil && !errNotified && !errors.Is(ferr, fault.ErrSignal) {
+				errNotified = true
+				code := fault.GetCode(ferr)
+				_ = ctrl.SendMsg(&wire.Error{
+					Code:    codeNum(code),
+					Fatal:   1,
+					Message: string(code),
+					Detail:  code.Condition(),
+				})
+			}
 			obs.LogFault(ctx, ferr)
 		case sum.FilesFailed > 0:
 			exit, outcome = 1, "partial"
@@ -145,7 +161,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	if err != nil {
 		return fail(err)
 	}
-	ctrl := channel.Control(ctrlNC, sess, channel.Sender)
+	ctrl = channel.Control(ctrlNC, sess, channel.Sender)
 	defer ctrl.Close()
 	pairEnd := obs.Start(ctx, "pair")
 	pairEnd("ok", obs.F("peer_version", sess.PeerVersion))
@@ -220,7 +236,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 
 	ds := newDigestStore()
 	cg := newCreditGate(int(ready.GroupCredit))
-	tr := newTracker(pl.NumGroups())
+	tr := newTracker(pl.GroupFirsts())
 
 	var cache *digest.Cache
 	if !cfg.NoCache {
@@ -351,6 +367,15 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	hb := obs.NewHeartbeat(octx, 0, 0, tr.inProgressGroups, func() int { return int(activeChannels.Load()) })
 	defer hb.Stop()
 
+	// Progress sink (§15.10). The receiver drives which files are skipped, so the
+	// sender does not know its own total; it reports bytes and files sent only.
+	prog := obs.NewProgress(octx, cfg.ProgressInterval)
+	defer prog.Stop()
+	prog.Feed(octx, func() (int64, int64, int64, int64) {
+		transferred, _, _, bytesSent := tr.counts()
+		return int64(bytesSent), 0, int64(transferred), 0
+	})
+
 	// --- 10. wait for termination, then drain -----------------------
 	drainEnd := obs.Start(ctx, "drain")
 	if err := tr.wait(rootCtx, cfg.DrainTimeout); err != nil {
@@ -477,7 +502,7 @@ func sessionParams(cfg Config, absRoot string, sourceKind uint8) *wire.SessionPa
 		RootName:        filepath.Base(absRoot),
 		SourceKind:      sourceKind,
 		HashAlg:         uint8(cfg.HashAlg),
-		GroupSize:       groupEntries,
+		GroupBytes:      uint64(cfg.GroupBytes),
 		Flags:           cfg.sessionFlags(),
 		SourcePlatform:  platformID(),
 		PathNorm:        1,

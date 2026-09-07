@@ -81,7 +81,7 @@ func TestServeHappyPath(t *testing.T) {
 	ds := newDigestStore()
 	ds.set(fid, sum[:])
 
-	tr := newTracker(1)
+	tr := newTracker([]uint64{0})
 	s, rx := newServicer(t, root, pl, ds, tr)
 	go func() { _ = s.run(context.Background()) }()
 
@@ -133,7 +133,7 @@ func TestServeResumeOffset(t *testing.T) {
 	fid, _ := pl.FileID("f")
 
 	ds := newDigestStore()
-	s, rx := newServicer(t, root, pl, ds, newTracker(1))
+	s, rx := newServicer(t, root, pl, ds, newTracker([]uint64{0}))
 	go func() { _ = s.run(context.Background()) }()
 
 	rx.send(&wire.FileRequest{RequestID: 1, FileID: fid, Offset: 10, MaxChunk: 8})
@@ -163,7 +163,7 @@ func TestServeUnknownFileID(t *testing.T) {
 	writeFile(t, filepath.Join(root, "f"), []byte("x"))
 	pl := buildPlan(t, root)
 
-	s, rx := newServicer(t, root, pl, newDigestStore(), newTracker(1))
+	s, rx := newServicer(t, root, pl, newDigestStore(), newTracker([]uint64{0}))
 	go func() { _ = s.run(context.Background()) }()
 
 	rx.send(&wire.FileRequest{RequestID: 1, FileID: 9999})
@@ -187,7 +187,7 @@ func TestServeVanishedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tr := newTracker(1)
+	tr := newTracker([]uint64{0})
 	s, rx := newServicer(t, root, pl, newDigestStore(), tr)
 	go func() { _ = s.run(context.Background()) }()
 
@@ -204,7 +204,7 @@ func TestServeVanishedFile(t *testing.T) {
 // T-PROTO-04: the sender's termination condition — every group decided and every
 // needed file resolved — releases the drain wait.
 func TestTrackerTerminationCondition(t *testing.T) {
-	tr := newTracker(2)
+	tr := newTracker([]uint64{0, 1024})
 
 	// group 0 needs index 3 (file_id 3); group 1 needs nothing.
 	if err := tr.decision(&wire.GroupDecision{GroupID: 0, Needed: []uint16{3}}); err != nil {
@@ -233,7 +233,7 @@ func TestTrackerTerminationCondition(t *testing.T) {
 // --drain-timeout. A session that is still moving must not trip the watchdog,
 // however long the tail runs.
 func TestTrackerDrainWatchdogIgnoresLiveTransfer(t *testing.T) {
-	tr := newTracker(1)
+	tr := newTracker([]uint64{0})
 	if err := tr.decision(&wire.GroupDecision{GroupID: 0, Needed: []uint16{0, 1}}); err != nil {
 		t.Fatal(err)
 	}
@@ -257,9 +257,9 @@ func TestTrackerDrainWatchdogIgnoresLiveTransfer(t *testing.T) {
 }
 
 // ...but a session that stops moving with work outstanding still trips it: that
-// is the accounting defect E9002 exists to catch.
+// is the stall E9002 exists to catch.
 func TestTrackerDrainWatchdogTripsOnStall(t *testing.T) {
-	tr := newTracker(1)
+	tr := newTracker([]uint64{0})
 	if err := tr.decision(&wire.GroupDecision{GroupID: 0, Needed: []uint16{0}}); err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestTrackerDrainWatchdogTripsOnStall(t *testing.T) {
 // inProgressGroups reports only decided groups with an unresolved needed
 // file, and drops a group once every needed file is resolved.
 func TestTrackerInProgressGroups(t *testing.T) {
-	tr := newTracker(3)
+	tr := newTracker([]uint64{0, 1024, 2048})
 	if got := tr.inProgressGroups(); len(got) != 0 {
 		t.Fatalf("in progress before any decision = %v, want none", got)
 	}
@@ -308,7 +308,7 @@ func TestTrackerInProgressGroups(t *testing.T) {
 
 // A duplicate GROUP_DECISION for one group is E5009.
 func TestTrackerDuplicateDecision(t *testing.T) {
-	tr := newTracker(1)
+	tr := newTracker([]uint64{0})
 	if err := tr.decision(&wire.GroupDecision{GroupID: 0}); err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"esync/internal/digest"
@@ -168,6 +169,11 @@ type decider struct {
 	sync func() error // journal sync at the group boundary
 
 	counters *obs.Counters
+
+	// Running totals of needed content, grown one group at a time; nil in tests
+	// that exercise decideGroup directly.
+	neededBytes *atomic.Int64
+	neededFiles *atomic.Int64
 }
 
 // decideGroup evaluates every entry in gm, materialises directories, symlinks
@@ -245,6 +251,11 @@ func (d *decider) decideGroup(ctx context.Context, gm *wire.GroupManifest) error
 	}
 
 	sort.Slice(needed, func(i, j int) bool { return needed[i] < needed[j] })
+
+	if d.neededBytes != nil {
+		d.neededBytes.Add(neededBytes)
+		d.neededFiles.Add(int64(len(needed)))
+	}
 
 	// GROUP_DECISION first so the sender can begin serving this group's requests.
 	if err := d.send(&wire.GroupDecision{

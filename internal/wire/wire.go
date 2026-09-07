@@ -24,7 +24,7 @@ const (
 	// Magic prefixes CLIENT_HELLO and CHANNEL_JOIN (§6.2, §6.4).
 	Magic = "ESYNC"
 	// ProtocolVersion is the version byte this build speaks.
-	ProtocolVersion uint8 = 0x01
+	ProtocolVersion uint8 = 0x02
 	// FrameHeaderLen is the fixed frame prefix: msg_type u8 + body_len u32.
 	FrameHeaderLen = 5
 )

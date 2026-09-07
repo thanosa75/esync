@@ -9,9 +9,10 @@ integrity-checked, differential (identical files are not re-sent), and paralleli
 link. No accounts, no daemon, no persistent config or state. It is written in Go (`module esync`,
 `go 1.27.1`) and ships as a single self-contained static binary requiring no runtime dependencies
 and no elevated privileges, targeting Linux (x86-64, arm64) and macOS (arm64, x86-64) with
-cross-platform transfers in both directions. The repository is currently a skeleton: `src/main.go`
-is a stub and the design is fully specified in `doc/` (see Further Reading); `doc/ARCHITECTURE.md`
-§17 is the target package layout (`main.go` at root, code under `internal/`).
+cross-platform transfers in both directions. The package layout follows `doc/ARCHITECTURE.md` §17:
+`main.go`/`cli.go` at the module root (flag parsing, mode dispatch, exit-code mapping) with the
+sender/receiver state machines and supporting code under `internal/` (`sender`, `receiver`, `plan`,
+`wire`, `channel`, `crypto`, `digest`, `paircode`, `fsx`, `obs`, `fault`).
 
 ## Build and Test Commands
 
@@ -21,7 +22,7 @@ Go is not installed in this environment (`go 1.27.1` required).
 
 ```sh
 make build                     # static binary into ./bin (CGO_ENABLED=0, version-stamped)
-make run ARGS="./somedir"      # go run ./src with arguments
+make run ARGS="./somedir"      # go run . with arguments
 make dist                      # cross-compile linux/macos amd64+arm64 into ./dist + SHA256SUMS
 make test                      # full suite with the race detector
 make cover-check               # tests + fail under 80% total coverage
@@ -29,9 +30,9 @@ make diagrams                  # render doc/ARCHITECTURE.md mermaid blocks to do
 make verify                    # tidy/fmt/vet/lint + goroutine check + tests (pre-commit)
 ```
 
-Equivalent raw commands: `go build -o bin/esync ./src`, `go test -race ./...`,
-`go test -cover ./...`, `go vet ./...`, `gofmt -l -w .`. `MAIN_PKG` defaults to `./src`; override it
-(`make build MAIN_PKG=.`) once the entrypoint moves to the module root per `doc/ARCHITECTURE.md` §17.
+Equivalent raw commands: `go build -o bin/esync .`, `go test -race ./...`,
+`go test -cover ./...`, `go vet ./...`, `gofmt -l -w .`. `MAIN_PKG` defaults to `.` (the module
+root, per `doc/ARCHITECTURE.md` §17).
 
 ## Code Style Guidelines
 

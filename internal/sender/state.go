@@ -14,9 +14,6 @@ import (
 	"esync/internal/wire"
 )
 
-// groupEntries is the fixed number of plan entries per group (§10.4).
-const groupEntries = 1024
-
 // digestStore holds the per-file content digests computed by the manifest
 // publisher, so the servicers can re-assert them in FILE_HEADER and verify the
 // streamed bytes.
@@ -90,6 +87,8 @@ func (g *creditGate) acquire(ctx context.Context) error {
 type tracker struct {
 	mu            sync.Mutex
 	totalGroups   int
+	groupFirst    []uint64          // group id -> first file id (§10.4, from plan.GroupFirsts)
+	fileGroup     map[uint64]uint32 // needed file id -> owning group id
 	groupsDecided int
 	decidedSet    map[uint32]bool
 	needed        map[uint64]bool
@@ -114,9 +113,11 @@ type tracker struct {
 	progress atomic.Uint64
 }
 
-func newTracker(totalGroups int) *tracker {
+func newTracker(groupFirst []uint64) *tracker {
 	t := &tracker{
-		totalGroups:  totalGroups,
+		totalGroups:  len(groupFirst),
+		groupFirst:   groupFirst,
+		fileGroup:    map[uint64]uint32{},
 		decidedSet:   map[uint32]bool{},
 		needed:       map[uint64]bool{},
 		resolved:     map[uint64]bool{},
@@ -156,14 +157,20 @@ func (t *tracker) reevalLocked() {
 func (t *tracker) decision(m *wire.GroupDecision) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if int(m.GroupID) >= len(t.groupFirst) {
+		return fault.Newf(fault.E5001, "group decision", groupSubject(m.GroupID), nil,
+			"group id out of range (have %d groups)", len(t.groupFirst))
+	}
 	if t.decidedSet[m.GroupID] {
 		return fault.Newf(fault.E5009, "group decision", groupSubject(m.GroupID), nil, "duplicate decision")
 	}
 	t.decidedSet[m.GroupID] = true
 	t.groupsDecided++
-	first := uint64(m.GroupID) * groupEntries
+	first := t.groupFirst[m.GroupID]
 	for _, idx := range m.Needed {
-		t.needed[first+uint64(idx)] = true
+		fid := first + uint64(idx)
+		t.needed[fid] = true
+		t.fileGroup[fid] = m.GroupID
 	}
 	t.skippedCount += uint64(m.SkippedCount)
 	t.rejectedCount += uint64(len(m.Rejected))
@@ -278,7 +285,7 @@ func (t *tracker) inProgressGroups() []uint32 {
 	set := map[uint32]struct{}{}
 	for fid := range t.needed {
 		if !t.resolved[fid] {
-			set[uint32(fid/groupEntries)] = struct{}{}
+			set[t.fileGroup[fid]] = struct{}{}
 		}
 	}
 	ids := make([]uint32, 0, len(set))

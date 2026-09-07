@@ -47,6 +47,8 @@ type Config struct {
 	CheckpointInterval int64         // --checkpoint-interval (parsed; part-checkpoint resume is stubbed)
 	ResumeWindow       time.Duration // --resume-window (parsed only)
 	DrainTimeout       time.Duration // --drain-timeout (E9002)
+	StallTimeout       time.Duration // --stall-timeout: max silence on a data channel before E3005
+	ProgressInterval   time.Duration // --progress-interval: stderr progress cadence
 	AllowUnsafeLinks   bool          // --allow-unsafe-links
 	Owner              bool          // --owner
 
@@ -91,6 +93,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.DrainTimeout <= 0 {
 		c.DrainTimeout = 60 * time.Second
+	}
+	if c.StallTimeout <= 0 {
+		c.StallTimeout = 60 * time.Second
+	}
+	if c.ProgressInterval <= 0 {
+		c.ProgressInterval = 5 * time.Second
 	}
 	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 10 * time.Second

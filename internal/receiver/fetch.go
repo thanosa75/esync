@@ -36,6 +36,7 @@ type fetcher struct {
 	counters *obs.Counters
 	reqID    interface{ Add(uint64) uint64 }
 	rnd      *rand.Rand
+	stall    time.Duration // per-receive ceiling on a data channel; 0 disables
 
 	onComplete func(fileID uint64)
 	fail       func(error)
@@ -94,7 +95,7 @@ func (f *fetcher) fetchOne(ctx context.Context, it needItem) error {
 		return transportData(err)
 	}
 
-	m, err := f.conn.RecvMsg()
+	m, err := f.conn.RecvMsgTimeout(f.stall)
 	if err != nil {
 		return transportData(err)
 	}
@@ -129,7 +130,7 @@ func (f *fetcher) fetchOne(ctx context.Context, it needItem) error {
 
 	var written uint64
 	for {
-		m, err := f.conn.RecvMsg()
+		m, err := f.conn.RecvMsgTimeout(f.stall)
 		if err != nil {
 			part.Close()
 			return transportData(err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,11 +49,13 @@ func (s *sendLog) only(t *testing.T) *wire.GroupDecision {
 }
 
 type testDecider struct {
-	dec *decider
-	log *sendLog
-	q   *needQueue
-	cnt *obs.Counters
-	dir string
+	dec         *decider
+	log         *sendLog
+	q           *needQueue
+	cnt         *obs.Counters
+	dir         string
+	neededBytes atomic.Int64
+	neededFiles atomic.Int64
 }
 
 func newTestDecider(t *testing.T, cfg Config, plat fsx.Platform, prior map[uint64]fsx.Record) *testDecider {
@@ -85,7 +88,10 @@ func newTestDecider(t *testing.T, cfg Config, plat fsx.Platform, prior map[uint6
 		send:       log.fn,
 		counters:   cnt,
 	}
-	return &testDecider{dec: d, log: log, q: q, cnt: cnt, dir: dir}
+	td := &testDecider{dec: d, log: log, q: q, cnt: cnt, dir: dir}
+	d.neededBytes = &td.neededBytes
+	d.neededFiles = &td.neededFiles
+	return td
 }
 
 func fileEntry(path string, data []byte, digestBytes []byte, mtime time.Time) wire.ManifestEntry {
@@ -117,6 +123,31 @@ func TestDecideNeedsAbsentFile(t *testing.T) {
 	it, ok := td.q.pop(context.Background())
 	if !ok || it.fileID != 0 || it.size != int64(len(data)) {
 		t.Fatalf("queued item = %+v, ok=%v", it, ok)
+	}
+}
+
+// The decider grows the running needed-bytes/needed-files totals (the progress
+// denominator, §15.10) by the needed entries only — a present, identical file
+// contributes nothing.
+func TestDecideAccumulatesNeededTotals(t *testing.T) {
+	td := newTestDecider(t, Config{}.withDefaults(), fsx.PlatformLinux, nil)
+	want := []byte("twelve bytes")
+	have := []byte("present already")
+	if err := os.WriteFile(filepath.Join(td.dir, "have.txt"), have, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gm := &wire.GroupManifest{Entries: []wire.ManifestEntry{
+		fileEntry("want.txt", want, md5sum(t, want), time.Unix(1000, 0)),
+		fileEntry("have.txt", have, md5sum(t, have), time.Unix(1000, 0)),
+	}}
+	if err := td.dec.decideGroup(context.Background(), gm); err != nil {
+		t.Fatalf("decideGroup: %v", err)
+	}
+	if got := td.neededBytes.Load(); got != int64(len(want)) {
+		t.Fatalf("neededBytes = %d, want %d", got, len(want))
+	}
+	if got := td.neededFiles.Load(); got != 1 {
+		t.Fatalf("neededFiles = %d, want 1", got)
 	}
 }
 

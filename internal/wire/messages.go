@@ -9,7 +9,7 @@ type SessionParams struct {
 	RootName        string
 	SourceKind      uint8
 	HashAlg         uint8
-	GroupSize       uint32
+	GroupBytes      uint64
 	Flags           uint32
 	SourcePlatform  uint8
 	PathNorm        uint8

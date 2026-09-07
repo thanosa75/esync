@@ -50,6 +50,12 @@ type session struct {
 
 	reqID atomic.Uint64
 
+	// Running totals of what the decider has determined is actually needed
+	// (skips and rejects excluded), grown group by group and read by the
+	// progress sink as the denominator.
+	neededBytes atomic.Int64
+	neededFiles atomic.Int64
+
 	fatalMu  sync.Mutex
 	fatalErr error
 
@@ -165,6 +171,7 @@ func (s *session) newFetcher(octx obs.Ctx, conn *channel.Conn) *fetcher {
 		counters:   s.cnt,
 		reqID:      &s.reqID,
 		rnd:        rand.New(rand.NewSource(int64(conn.ID())*7919 + time.Now().UnixNano())),
+		stall:      s.cfg.StallTimeout,
 		onComplete: s.recordComplete,
 		fail:       s.fail,
 	}
@@ -306,6 +313,18 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	}
 	fail := func(err error) (Summary, int) {
 		s.fail(err)
+		return finish()
+	}
+	// abandoned is fail() for the pre-reconciliation waits: the root context was
+	// cancelled before the session finished, and if the control reader recorded
+	// no cause (a bare EOF — the sender process died, or its own watchdog tore
+	// the connection down without sending wire.Error) the run must still not be
+	// mistaken for a clean success. The transfer is incomplete; keep the journal
+	// and tell the operator to resume.
+	abandoned := func(stage string) (Summary, int) {
+		if s.err() == nil {
+			s.fail(fault.Newf(fault.E4005, stage, "", nil, "control channel closed before the transfer completed"))
+		}
 		return finish()
 	}
 
@@ -504,7 +523,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	select {
 	case scComplete = <-scanCh:
 	case <-rootCtx.Done():
-		return finish()
+		return abandoned("await SCAN_COMPLETE")
 	case <-time.After(cfg.DrainTimeout):
 		return fail(fault.New(fault.E9002, "await SCAN_COMPLETE", "", nil))
 	}
@@ -534,22 +553,24 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	s.dest, s.journal, s.algo, s.q, s.meta, s.hl = dest, journal, algo, q, meta, hl
 
 	dec := &decider{
-		octx:       octx,
-		cfg:        cfg,
-		dest:       dest,
-		q:          q,
-		guard:      guard,
-		algo:       algo,
-		destPlat:   destPlat,
-		cache:      cache,
-		dryRun:     cfg.DryRun,
-		collisions: fsx.NewCollisions(destPlat),
-		hl:         hl,
-		meta:       meta,
-		prior:      prior,
-		dirMeta:    map[string]dirRec{},
-		send:       ctrl.SendMsg,
-		counters:   s.cnt,
+		octx:        octx,
+		cfg:         cfg,
+		dest:        dest,
+		q:           q,
+		guard:       guard,
+		algo:        algo,
+		destPlat:    destPlat,
+		cache:       cache,
+		dryRun:      cfg.DryRun,
+		collisions:  fsx.NewCollisions(destPlat),
+		hl:          hl,
+		meta:        meta,
+		prior:       prior,
+		dirMeta:     map[string]dirRec{},
+		send:        ctrl.SendMsg,
+		counters:    s.cnt,
+		neededBytes: &s.neededBytes,
+		neededFiles: &s.neededFiles,
 	}
 	if journal != nil {
 		dec.sync = journal.Sync
@@ -583,6 +604,16 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		}
 		hb := obs.NewHeartbeat(octx, 0, 0, q.inProgressGroups, s.channelCount)
 		defer hb.Stop()
+
+		// Progress sink (§15.10). Totals grow as groups are decided; both are 0
+		// until the first GROUP_MANIFEST is processed, which reads as "not known
+		// yet" rather than "complete".
+		prog := obs.NewProgress(octx, cfg.ProgressInterval)
+		defer prog.Stop()
+		prog.Feed(octx, func() (int64, int64, int64, int64) {
+			return s.cnt.Bytes.Load(), s.neededBytes.Load(),
+				s.cnt.FilesTransferred.Load(), s.neededFiles.Load()
+		})
 	}
 
 	done := make(chan struct{})
@@ -609,8 +640,8 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 
 	// The drain watchdog (§13.7) bounds only the tail: once termination is
 	// reachable (every group decided, need queue empty), every issued
-	// request_id terminating within DrainTimeout is required, or it's a fatal
-	// accounting defect (E9002). Reaching "reachable" is real transfer time
+	// request_id terminating within DrainTimeout is required, or the transfer
+	// has stalled with work outstanding (E9002). Reaching "reachable" is real transfer time
 	// and is not itself bounded by DrainTimeout — only once the root context
 	// is separately cancelled (signal, another fatal error) does
 	// workerStopGrace bound how long Run waits for the decide/fetch
@@ -646,7 +677,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	select {
 	case ss = <-summaryCh:
 	case <-rootCtx.Done():
-		return finish()
+		return abandoned("await SESSION_SUMMARY")
 	case <-time.After(cfg.DrainTimeout):
 		return fail(fault.New(fault.E9002, "await SESSION_SUMMARY", "", nil))
 	}

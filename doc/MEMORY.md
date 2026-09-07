@@ -68,13 +68,94 @@ transferred, sender E9002 at 14:44:10 vs last decisions at 14:43:12), which
 the operator saw as "an accounting defect; report with the log" — E9002 must
 mean *stalled*, never merely *slow*.
 
-<!--
-MFR-0005 · <area> · <the rule, imperative> — <why: the bug it prevents>
--->
+MFR-0005 · channel/receiver-fetch · Every data-channel receive in the fetcher
+(`fetchOne`'s FILE_HEADER wait and its FILE_CHUNK loop) MUST go through
+`Conn.RecvMsgTimeout(cfg.StallTimeout)`, never bare `RecvMsg()`. Data channels
+carry no keepalive (only the control channel does), so a sender that accepts a
+FILE_REQUEST and then goes silent — process wedged, asymmetric partition, host
+half-open — parks `RecvMsg` on `ReadFrame` forever while the control keepalive
+stays happy (a wedged sender still answers PING). The receiver then hangs with
+no error and no journal progress until the operator kills it. Expiry is E3005
+(fatal, non-retryable — retrying a dead conn just burns MaxRetries ×
+StallTimeout per file); the session ends, the journal is retained, a re-run
+resumes.
+
+MFR-0006 · plan/digest · The group-packing byte target (`--group-bytes`,
+`plan.Options.GroupBytes`) MUST NOT be folded into `computeDigest`. Grouping is
+transport tuning only; the manifest digest is the resume/peer-compat identity.
+Folding it would force a full re-transfer of an in-progress job whenever the
+operator retuned the group size (or the default changed between builds). The
+digest still folds a `u32` slot where `group_size` used to live — now a literal
+`0` — so on-disk journals from protocol v1 are invalidated by the version bump,
+not by this field.
+
+MFR-0007 · sender/receiver run · Both `sender.Run` and `receiver.Run` MUST
+instantiate `obs.NewProgress` + `prog.Feed(...)` (inside `if !cfg.DryRun` on the
+receiver) with `defer prog.Stop()`, next to the heartbeat. The renderer existed
+in `internal/obs` from the first commit but neither run path ever created one,
+so `--progress-interval` did nothing and no progress line was ever shown — the
+operator's repeated "the progress bar still does not show". The heartbeat (a
+log-sink mechanism) is not a substitute: it does not write the stderr progress
+sink REQ-CLI-006/007 require.
 
 ---
 
 ## Session Log
+
+### 2026-09-07 — grouping + reliability bundle (progress bar, stall detection, size-based groups)
+
+- One bundled batch from four operator complaints after a failed ~43GB resume.
+  Carries a **protocol version bump 1→2** (handshake `protocolVersion`, wire
+  `ProtocolVersion`, plan digest `protocolVersion`, journal `sessionInfo`), so v1
+  journals are invalidated and cross-version pairing is rejected — the operator
+  accepted this.
+- **Fix #1 — progress bar (MFR-0007).** `obs.Progress` was never instantiated by
+  either run path. Added `Progress.Feed(ctx, sample)` (samples live counters on
+  the render interval — keeps the push-model API `TestProgressNoDeadlock`
+  pins), taught `render()` to drop "/ total" when a total is 0 ("not known
+  yet"), and added a smoothed rate + `eta` (REQ-CLI-006). Wired into both
+  `Run`s next to the heartbeat with `defer prog.Stop()`; `ProgressInterval`
+  added to both Configs, plumbed from `*c.progressInterval` in cli.go. Receiver
+  total = running sum from `decider.decideGroup` (`session.neededBytes/
+  neededFiles`, needed entries only, grows per group); sender renders sent-only
+  (it can't know receiver skips).
+- **Fix #2 — bogus E9002.** Split: (a) E9002 reworded (done earlier this
+  session-series, MFR-0004); (b) control-loss before SESSION_SUMMARY now a
+  failure; (c) **stall detection (MFR-0005)** — new `Conn.RecvMsgTimeout(d)`
+  (per-receive read deadline, `net.Error` timeout → E3005), fetcher gained a
+  `stall` field fed from new `--stall-timeout` (default 60s), used on both
+  data-channel receives in `fetchOne`. (d) FILE_CANCEL protocol change —
+  **WONTFIX**, disproportionate (see follow-ups).
+- **Fix #3 — clean re-run.** Addressed by Fix #2c: the hang that left journals
+  half-written is now a clean E3005 exit, so the next run's digest-match resume
+  path sees a consistent journal and skips completed files ("no transfers").
+- **Fix #4 — size-based grouping (MFR-0006).** `computeGroups` walks sorted
+  entries once, opening a new group when the current one is non-empty AND (holds
+  ≥1024 entries OR adding this file's bytes exceeds the `--group-bytes` target,
+  default 512 MiB). Oversize single file = its own group; entries never split.
+  `wire.SessionParams.GroupSize uint32` → `GroupBytes uint64` (advisory).
+  `GroupManifest.FirstFileID` already carried boundaries, so `decide.go` needed
+  zero changes. Digest `group_size u32` slot → literal `0`; `--group-bytes` not
+  folded (MFR-0006). ARCHITECTURE §10.4/§10.5/§9.3/§16.2 and INITIAL_REQS
+  REQ-SCAN-010/024, §4.2, CON-04, glossary rewritten.
+- Full gate green: `gofmt` clean, `go vet ./...`, `go build ./...`,
+  `go test -race ./...` all packages. Coverage on changed packages: obs 87.8%,
+  receiver 84.3%, plan 92.8%, wire 97.0%, channel 77.6%, fault 96.4%.
+  `internal/sender` shows 39.2% in isolation — pre-existing (`Run`/`walk.go` are
+  covered by the root e2e test, not sender unit tests); the 6-line Progress
+  wiring mirrors the untested heartbeat wiring from commit 8a2067a and is
+  exercised by `TestE2ETransfer` (now runs with a 10ms `ProgressInterval`).
+- Tests added: `channel.TestRecvMsgTimeout`, `receiver.TestFetchStallTimeout` +
+  `TestFetchStallTimeoutMidStream`, `receiver.TestDecideAccumulatesNeededTotals`,
+  `obs.TestProgressFeed` + `TestProgressRenderLine`, `plan.TestGroupingBySize`,
+  updated `wire.TestGoldenWire` golden vector for the 8-byte `group_bytes`.
+- Branch: `grouping-and-reliability` (session started on `main`).
+- Follow-ups (new): **FILE_CANCEL** — when the receiver gives up on a file after
+  its retry budget, it does not tell the sender, which keeps the request_id
+  inflight; harmless today (drain watchdog + summary reconcile) but a clean
+  R→S FILE_CANCEL + sender reconciliation would be tidier. Needs a wire message
+  → deferred as not worth another protocol change in this batch. Also: the
+  sender `drain` span still bills the whole transfer (from the prior entry).
 
 ### 2026-09-07 — sender E9002 drain watchdog: deadline → inactivity
 
@@ -307,70 +388,9 @@ MFR-0005 · <area> · <the rule, imperative> — <why: the bug it prevents>
   path; `--shutdown-grace` / `--spill-threshold` are parsed and validated but
   not yet consumed by sender/receiver.
 
-### 2026-09-04 — internal/receiver package
+### 2026-09-04 — earlier sessions (pruned)
 
-- Built the RECEIVER half against the existing wire protocol / `internal/channel`
-  / `internal/sender` (all committed, untouched). New package `internal/receiver`:
-  `config.go` `queue.go` `space.go` `decide.go` `fetch.go` `run.go` `tune.go`.
-- `Run(ctx obs.Ctx, cfg Config) (Summary, int)` drives §4.2: decode pairing code
-  before IO (E2001) → `channel.Dial` racing candidates + `ClientHandshake` →
-  `channel.Control` → recv SESSION_PARAMS (adopt sender's `hash_alg`) → resolve
-  dest `./<RootName>` or `--dest`, `fsx.OpenDest` (E1006) → send SESSION_READY
-  (advertises `MaxChunk = 1<<20-8192`, `GroupCredit`, N = min(--channels,
-  sp.MaxChannels)) → dial N data channels + `JoinChannel` → control-reader goroutine
-  (SCAN_COMPLETE/GROUP_MANIFEST/SESSION_SUMMARY) → `fsx.Open` journal+resume →
-  decide-worker pool + one fetcher per data channel → drain (INV-7) → recv
-  SESSION_SUMMARY, compare completion digest (E5005 exit 2), send
-  SESSION_SUMMARY_ACK → journal.Clear on success / retain + print resume hint.
-- decide (§11.2): `fsx.ValidatePath` → reject w/ numeric code; `fsx.Collisions`;
-  journal `prior` skip; dir/symlink/hardlink materialisation; §11.2 table incl
-  `--quick` (size+mtime); largest-first enqueue; ONE GROUP_DECISION per group
-  (INV-1) then CREDIT{+1} (T-PROTO-08); free-space guard §12.7 (WARN then E7003
-  before writing).
-- fetch (§12.2): FILE_REQUEST (always offset 0 — see follow-ups) → FILE_HEADER →
-  `.part` truncate+stream, offset-contiguity E5006 fatal, ENOSPC E7003 fatal, hash
-  → FILE_COMPLETE: byte count E8002, streamed digest E8001, manifest digest E8003,
-  `fsx.PublishPart` (E7006 = content-ok/meta-warn), `journal.MarkComplete`,
-  hardlink secondaries. Retry policy §14.3 via `fault.Backoff` + `--max-retries`.
-- completion digest = SHA-256 over ascending u64-BE file_ids that reached
-  FILE_COMPLETE this session (matches `sender/state.go`).
-- Goroutines all via `obs.Go` returning nil, routed through `session.fail` +
-  root-ctx cancel (obs.Go escalates Fatal returns to the global OnFatal, which
-  Run must not trigger). `make check-goroutines` clean.
-- Fixed while integrating: MFR-0001 (read-only manifest dir mode blocked child
-  publish). `decideDir` now creates 0o755, `applyDirMeta` stamps real mode+mtime
-  deepest-first at session end.
-- Tests (`-race`, coverage 81.8%): P-QUEUE-01 (order/bound/no-drop/no-double-yield),
-  T-DEC-01/02/03 + collision/unsafe-path/free-space/dir/symlink/hardlink,
-  T-RES-01 (journal skip), T-XFER-02 (digest-mismatch retry), T-XFER-03 (atomic
-  publish), T-PROTO-08 (credit), fetch component test vs in-memory sender stub,
-  T-PROTO-06 end-to-end `Run` vs a loopback fake sender (+ resume/no-op run).
-- Out of scope (follow-ups): adaptive tuner (`tune.go` stub, `--channels` fixed,
-  min/max parsed only); BLAKE3 (E1007); effective pipeline depth 1/channel;
-  `.part` checkpoint resume §11.4 (offset always 0); E1008 self-copy not
-  enforceable receiver-side; `--dry-run` has no clean protocol shutdown;
-  SESSION_RESUME (0x70) unimplemented; E2005 indistinguishable from E4001.
-
-### 2026-09-04 — Initial vertical-slice implementation
-
-- Repo was a skeleton (`src/main.go` stub only); full design in `doc/`.
-- Moved entrypoint to module root per ARCHITECTURE §17; `Makefile` `MAIN_PKG ?= .`.
-- Target for this session: a **working vertical slice** (agreed with user) — a real
-  encrypted LAN transfer through the whole pipeline, race-tested, with golden/property
-  tests and one E2E test. Out of session scope (documented follow-ups): BLAKE3 digest,
-  adaptive channel tuner (fixed `--channels` only), fault-injection seams (`F-*`),
-  benchmarks (`B-*`), and full `§18.1` `T-`/`D-` matrix coverage.
-- Implementation run as a phased multi-agent workflow over the `internal/` packages
-  from `ARCHITECTURE §17`, integrated by the orchestrator.
-- Digest: MD5 + SHA-256 only (stdlib). `hash_alg` wire field keeps BLAKE3 (id 1)
-  reserved. Handshake crypto is pure stdlib (`crypto/ecdh`, `crypto/hkdf`).
-- `internal/fault` + `internal/obs` landed (base packages). fault: full §14.2
-  catalogue in one policy table (`catalogue.go`), `*Fault` with code-driven
-  Class/Retryable, `New/Newf/Wrap/WithCtx`, `ExitCode`, `Backoff`, `IsRetryable`,
-  `IsFatal`. `Signal`/`ErrSignal` for exit 5. obs: leveled structured logger
-  (`Level` starts at 1 so the zero value is "unset"), text+json formats, `Ctx`
-  trace context + `With`, spans, trace ring, non-blocking sink (drop+count),
-  `Counters`, `Summary`, `Secret`/`RedactedString` redaction, `Progress`,
-  `obs.Go`/`OnFatal`/`DumpRing`. obs imports fault (no cycle; fault imports
-  neither). Deferred here: adaptive tuner, F-* seams, BLAKE3, benchmarks,
-  full T-/D- matrix.
+- Entries for the initial vertical-slice implementation, the `internal/receiver`
+  package build, and the CLI-wiring/E2E/coverage-gate session were pruned to keep
+  this file under 400 lines. Their MFRs (MFR-0001) and follow-ups are retained
+  above / below. See git history for detail.
