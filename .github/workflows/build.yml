@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # the release job publishes the rolling "latest" release
 
 jobs:
   build:
@@ -34,12 +34,47 @@ jobs:
           go-version-file: go.mod
 
       - name: Cross-compile static binary
-        run: make dist PLATFORMS="${{ matrix.goos }}/${{ matrix.goarch }}"
+        run: |
+          make dist \
+            VERSION="g$(git rev-parse --short HEAD)" \
+            PLATFORMS="${{ matrix.goos }}/${{ matrix.goarch }}"
+          # Publish under a stable, version-less asset name so the install
+          # script can hit a predictable URL.
+          mv dist/esync-*-${{ matrix.goos }}-${{ matrix.goarch }} \
+             dist/esync-${{ matrix.goos }}-${{ matrix.goarch }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: esync-${{ matrix.target }}
-          path: |
-            dist/esync-*-${{ matrix.goos }}-${{ matrix.goarch }}
-            dist/SHA256SUMS
+          path: dist/esync-${{ matrix.goos }}-${{ matrix.goarch }}
           if-no-files-found: error
+
+  release:
+    name: publish latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: esync-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish rolling "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum esync-* > SHA256SUMS
+          cd ..
+          gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Latest build" \
+            --notes "Rolling build from ${GITHUB_SHA} — updated on every push to main." \
+            --prerelease \
+            dist/esync-linux-amd64 \
+            dist/esync-darwin-arm64 \
+            dist/SHA256SUMS
