@@ -59,10 +59,8 @@ fi
 chmod +x "$tmp/$asset"
 
 target="${BIN_DIR}/esync"
-if [ -d "$BIN_DIR" ] && [ -w "$BIN_DIR" ]; then
+if mkdir -p "$BIN_DIR" 2>/dev/null && [ -w "$BIN_DIR" ]; then
 	mv "$tmp/$asset" "$target"
-elif [ "$(id -u)" = 0 ]; then
-	mkdir -p "$BIN_DIR" && mv "$tmp/$asset" "$target"
 elif command -v sudo >/dev/null 2>&1; then
 	echo "esync: ${BIN_DIR} needs elevated write — using sudo" >&2
 	sudo mkdir -p "$BIN_DIR" && sudo mv "$tmp/$asset" "$target"
