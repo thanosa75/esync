@@ -1,0 +1,14 @@
+# Build output
+/bin/
+/build/
+/dist/
+/esync
+*.test
+*.out
+
+# E2E / manual test scratch trees
+/test1/
+/test2/
+
+# Editor / OS
+.DS_Store
