@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	protocolVersion = 1
+	protocolVersion = 2
 	magic           = "ESYNC"
 	nonceLen        = 32
 	pubLen          = 32

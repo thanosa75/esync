@@ -14,7 +14,7 @@ import (
 func sampleMessages() []Message {
 	return []Message{
 		&SessionParams{
-			RootName: "Documents", SourceKind: 0, HashAlg: 0, GroupSize: 1024,
+			RootName: "Documents", SourceKind: 0, HashAlg: 0, GroupBytes: 512 << 20,
 			Flags: 0b10001, SourcePlatform: 0, PathNorm: 1, SenderVersion: "esync/0.1",
 			MaxChannels: 16, FilterSignature: "", SysexcludeTag: "sys-v1",
 		},
@@ -82,7 +82,7 @@ func sampleMessages() []Message {
 // (msg_type u8 | body_len u32 BE | body). Regenerate only on a deliberate
 // wire-format change.
 var goldenWire = map[MsgType]string{
-	MsgSessionParams:     "01000000300009446f63756d656e747300000000040000000011000100096573796e632f302e3100000010000000067379732d7631",
+	MsgSessionParams:     "01000000340009446f63756d656e74730000000000002000000000000011000100096573796e632f302e3100000010000000067379732d7631",
 	MsgSessionReady:      "020000001d0004000802001000000100096573796e632f302e310000010000000000",
 	MsgScanProgress:      "100000001400000000000004d2000000000056a73500000002",
 	MsgScanComplete:      "110000003a0000000000000064000000004000000000000001000000030020abababababababababababababababababababababababababababababababab",

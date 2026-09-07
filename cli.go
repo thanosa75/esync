@@ -230,6 +230,7 @@ func runSender(args []string) int {
 	keepSystemFiles := fs.Bool("keep-system-files", false, "disable the sys-v1 exclusion set")
 	hashWorkers := fs.Int("hash-workers", min(8, runtime.NumCPU()), "concurrent hashers")
 	readConcurrency := fs.Int("read-concurrency", 4, "concurrent file reads per channel")
+	groupBytes := fs.Int64("group-bytes", 512<<20, "target manifest group size in bytes")
 	_ = fs.Int("spill-threshold", 500_000, "external-sort spill threshold (parsed; in-memory sort in this build)")
 
 	var filters []plan.FilterRule
@@ -270,6 +271,7 @@ func runSender(args []string) int {
 		atLeast("max-pair-attempts", *maxPairAttempts, 1),
 		atLeast("hash-workers", *hashWorkers, 1),
 		atLeast("read-concurrency", *readConcurrency, 1),
+		atLeast("group-bytes", int(*groupBytes), 1<<20),
 	} {
 		if e != nil {
 			return usageErr(e)
@@ -291,6 +293,8 @@ func runSender(args []string) int {
 		MaxPairAttempts:  *maxPairAttempts,
 		HandshakeTimeout: *c.handshakeTimeout,
 		DrainTimeout:     60 * time.Second,
+		ProgressInterval: *c.progressInterval,
+		GroupBytes:       *groupBytes,
 		HashAlg:          hashAlg,
 		HashWorkers:      *hashWorkers,
 		ReadConcurrency:  *readConcurrency,
@@ -332,6 +336,7 @@ func runReceiver(args []string) int {
 	checkpointInterval := fs.Int64("checkpoint-interval", 64<<20, "resume checkpoint interval (parsed)")
 	resumeWindow := fs.Duration("resume-window", 60*time.Second, "reconnect window (parsed only)")
 	drainTimeout := fs.Duration("drain-timeout", 60*time.Second, "post-transfer drain watchdog")
+	stallTimeout := fs.Duration("stall-timeout", 60*time.Second, "max silence on a data channel before it is declared dead")
 	allowUnsafeLinks := fs.Bool("allow-unsafe-links", false, "materialise absolute/escaping symlinks")
 	owner := fs.Bool("owner", false, "restore ownership")
 
@@ -395,6 +400,8 @@ func runReceiver(args []string) int {
 		CheckpointInterval: *checkpointInterval,
 		ResumeWindow:       *resumeWindow,
 		DrainTimeout:       *drainTimeout,
+		StallTimeout:       *stallTimeout,
+		ProgressInterval:   *c.progressInterval,
 		AllowUnsafeLinks:   *allowUnsafeLinks,
 		Owner:              *owner,
 		Quick:              *c.quick,

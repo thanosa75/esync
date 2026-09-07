@@ -153,7 +153,7 @@ lingering state after completion.
 2. Sender binds a TCP listener, generates session key material, prints a pairing code, and waits.
 3. User copy-pastes the code to the receiver and runs `esync --link <code>`.
 4. Receiver decodes the code, connects, and both sides run an authenticated key exchange.
-5. Sender enumerates the tree deterministically and partitions it into ordered groups of 1024 files.
+5. Sender enumerates the tree deterministically and partitions it into ordered groups packed to a byte target (default 512 MiB) with a 1024-entry cap.
 6. For each group, the sender computes a digest per file and sends the group manifest.
 7. The receiver compares each manifest entry against the destination and decides *needed* vs *skip*.
 8. The receiver enqueues needed files and pulls them over several parallel channels.
@@ -374,8 +374,11 @@ Every blocking network operation MUST have a timeout. No code path may wait fore
 The sender MUST enumerate the source path **recursively**.
 
 **REQ-SCAN-010** · S · P0 · V:`T`
-Files MUST be partitioned into **groups of exactly 1024 files**, except the final group, which holds
-the remainder.
+Entries MUST be partitioned into ordered groups by a single forward pass over the sorted order: a
+group is closed when it would otherwise exceed a byte target (`--group-bytes`, default 512 MiB, summed
+over entry file sizes) or a hard cap of **1024 entries**, whichever comes first. A single entry larger
+than the byte target forms its own group; entries are never split across groups. The byte target is
+transport tuning only and MUST NOT enter the manifest digest.
 
 **REQ-SCAN-020** · S · P0 · V:`T`
 Grouping MUST be **reproducible**: two enumerations of an unchanged tree, on any supported platform,
@@ -399,8 +402,9 @@ platform allows it.
 
 **REQ-SCAN-024** · D · P0 · V:`T`
 Each file MUST receive a stable **file ID** equal to its zero-based index in the global sorted order.
-Group ID MUST be `file_id / 1024`. Both sides MUST be able to derive one from the other without extra
-state.
+Groups MUST be contiguous ranges of file IDs; each `GROUP_MANIFEST` carries its `first_file_id`, so
+entry *i* of a group has `file_id = first_file_id + i` and neither side needs to transmit per-entry
+file IDs.
 
 **REQ-SCAN-025** · D · P0 · V:`T`
 Filters (`REQ-CLI-011`) MUST be applied before ID assignment, and the active filter set MUST be
@@ -870,7 +874,7 @@ rather than asserted.
 | `CON-01` | Implementation language is Go (`go.mod` declares `module esync`, `go 1.27.1`). | Repository |
 | `CON-02` | Encryption must be AES-CBC. | Stated |
 | `CON-03` | Content digest must be MD5. | Stated |
-| `CON-04` | Group size must be 1024 files. | Stated |
+| `CON-04` | Groups are packed to a byte target (default 512 MiB) with a hard 1024-entry cap. | Stated (revised) |
 | `CON-05` | Pairing is code-based; no accounts, no certificates, no key files. | Stated |
 
 ## 8. Success Criteria
@@ -891,7 +895,7 @@ The **product** is accepted when every `P0` and `P1` requirement passes its stat
 | **Session** | One complete sender↔receiver interaction, from handshake to summary. |
 | **Control channel** | The single connection carrying manifests, decisions, credit, and lifecycle messages. |
 | **Data channel** | One of *N* connections carrying file requests and file content. |
-| **Group** | An ordered set of exactly 1024 files (final group: the remainder). |
+| **Group** | A contiguous run of sorted entries, packed to a byte target (default 512 MiB) or 1024 entries, whichever first. |
 | **Manifest** | The sender's description of a group: per-file identity, metadata, and digest. |
 | **Decision** | The receiver's reply to a manifest: which file IDs it needs. |
 | **File ID** | Zero-based index of a file in the global sorted enumeration; stable and shared. |

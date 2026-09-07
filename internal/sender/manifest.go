@@ -57,7 +57,7 @@ func (mp *manifestPublisher) run(ctx context.Context) error {
 
 func (mp *manifestPublisher) publishGroup(ctx context.Context, gi int, entries []plan.Entry) error {
 	end := obs.Start(mp.ctx, "group.publish")
-	firstID := uint64(gi) * groupEntries
+	firstID := mp.pl.GroupFirstID(gi)
 	gm := &wire.GroupManifest{
 		GroupID:     uint32(gi),
 		FirstFileID: firstID,

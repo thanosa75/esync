@@ -87,7 +87,7 @@ func Open(dest, sessionID string, manifestDigest [32]byte) (j *Journal, priorCom
 			SessionID:       sessionID,
 			ManifestDigest:  digestHex,
 			SourceRootName:  "",
-			ProtocolVersion: 1,
+			ProtocolVersion: 2,
 			StartedAt:       time.Now().UTC().Format(time.RFC3339),
 		}
 		buf, _ := json.MarshalIndent(si, "", "  ")

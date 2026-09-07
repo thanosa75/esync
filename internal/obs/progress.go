@@ -2,6 +2,7 @@ package obs
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -22,7 +23,12 @@ type Progress struct {
 
 	stop chan struct{}
 	once sync.Once
-	w    *os.File
+	w    io.Writer
+
+	// Rate/ETA estimate state, touched only by the render goroutine.
+	lastAt    time.Time
+	lastBytes int64
+	rate      float64 // bytes/sec, exponentially smoothed
 }
 
 // NewProgress starts the renderer. interval <= 0 uses 5s.
@@ -30,22 +36,49 @@ func NewProgress(ctx Ctx, interval time.Duration) *Progress {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
-	p := &Progress{
-		interval: interval,
-		tty:      isTTY(os.Stderr),
-		stop:     make(chan struct{}),
-		w:        os.Stderr,
-	}
+	p := newProgress(os.Stderr, isTTY(os.Stderr), interval)
 	Go(ctx, "progress", func() error { p.loop(); return nil })
 	return p
 }
 
-// Update sets the current byte and file counts.
+func newProgress(w io.Writer, tty bool, interval time.Duration) *Progress {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	return &Progress{
+		interval: interval,
+		tty:      tty,
+		stop:     make(chan struct{}),
+		w:        w,
+	}
+}
+
+// Update sets the current byte and file counts. A totalBytes or totalFiles of
+// zero is rendered as "not known yet" — only the done figure is shown.
 func (p *Progress) Update(doneBytes, totalBytes, doneFiles, totalFiles int64) {
 	p.doneBytes.Store(doneBytes)
 	p.totalBytes.Store(totalBytes)
 	p.doneFiles.Store(doneFiles)
 	p.totalFiles.Store(totalFiles)
+}
+
+// Feed drives Update from sample on the render interval until Stop. It is the
+// convenience for a caller that already holds live counters; do not also call
+// Update on the same Progress.
+func (p *Progress) Feed(ctx Ctx, sample func() (doneBytes, totalBytes, doneFiles, totalFiles int64)) {
+	Go(ctx, "progress.feed", func() error {
+		t := time.NewTicker(p.interval)
+		defer t.Stop()
+		p.Update(sample())
+		for {
+			select {
+			case <-p.stop:
+				return nil
+			case <-t.C:
+				p.Update(sample())
+			}
+		}
+	})
 }
 
 // Stop halts the renderer and clears the status line on a TTY.
@@ -72,13 +105,53 @@ func (p *Progress) loop() {
 func (p *Progress) render() {
 	db, tb := p.doneBytes.Load(), p.totalBytes.Load()
 	df, tf := p.doneFiles.Load(), p.totalFiles.Load()
-	if p.tty {
-		fmt.Fprintf(p.w, "\r\x1b[K  %s / %s   %d / %d files",
-			humanBytes(db), humanBytes(tb), df, tf)
-	} else {
-		fmt.Fprintf(p.w, "%s progress  %s / %s   %d / %d files\n",
-			time.Now().UTC().Format(tsLayout), humanBytes(db), humanBytes(tb), df, tf)
+
+	now := time.Now()
+	if !p.lastAt.IsZero() {
+		if dt := now.Sub(p.lastAt).Seconds(); dt > 0 {
+			inst := float64(db-p.lastBytes) / dt
+			if inst < 0 {
+				inst = 0
+			}
+			if p.rate == 0 {
+				p.rate = inst
+			} else {
+				p.rate = 0.6*p.rate + 0.4*inst
+			}
+		}
 	}
+	p.lastAt, p.lastBytes = now, db
+
+	bytesStr := humanBytes(db)
+	if tb > 0 {
+		bytesStr += " / " + humanBytes(tb)
+	}
+	filesStr := fmt.Sprintf("%d", df)
+	if tf > 0 {
+		filesStr += fmt.Sprintf(" / %d", tf)
+	}
+	line := fmt.Sprintf("%s   %s files   %s", bytesStr, filesStr, humanRate(p.rate))
+	if tb > db && p.rate > 0 {
+		line += "   eta " + formatETA(time.Duration(float64(tb-db)/p.rate*float64(time.Second)))
+	}
+	if p.tty {
+		fmt.Fprintf(p.w, "\r\x1b[K  %s", line)
+	} else {
+		fmt.Fprintf(p.w, "%s progress  %s\n", time.Now().UTC().Format(tsLayout), line)
+	}
+}
+
+// formatETA renders a remaining-time estimate as H:MM:SS (hours omitted below 1h).
+func formatETA(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	s := int(d.Seconds())
+	h, m, sec := s/3600, (s%3600)/60, s%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	return fmt.Sprintf("%02d:%02d", m, sec)
 }
 
 func isTTY(f *os.File) bool {

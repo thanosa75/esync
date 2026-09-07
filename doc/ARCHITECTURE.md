@@ -101,7 +101,7 @@ This split is deliberate: the receiver is the only party that knows what it alre
 
 | Flow | Direction | Channel | Volume |
 |---|---|---|---|
-| Manifests (identity + digest of 1024 files) | S → R | control | ~120 KB per group |
+| Manifests (identity + digest, ≤1024 entries / ~512 MiB per group) | S → R | control | ~120 KB per group |
 | Decisions and credit | R → S | control | ~2 KB per group |
 | File requests | R → S | data *i* | ~32 B each |
 | File content | S → R | data *i* | bulk |
@@ -218,7 +218,7 @@ sequenceDiagram
   S->>R: SERVER_CONFIRM {HMAC(transcript)}
   R->>S: CLIENT_CONFIRM {HMAC(transcript)}
   Note over S,R: code claimed; keys installed; all later traffic encrypted
-  S->>R: SESSION_PARAMS {root, hash alg, group size, flags}
+  S->>R: SESSION_PARAMS {root, hash alg, group bytes, flags}
   R->>S: SESSION_READY {channels, credit, pipeline depth}
   R->>S: CHANNEL_JOIN x N (new connections)
   S->>R: CHANNEL_ACCEPT x N
@@ -227,7 +227,7 @@ sequenceDiagram
     S->>R: SCAN_COMPLETE {totals, manifest digest}
   and Group pipeline
     loop per group while credit > 0
-      S->>R: GROUP_MANIFEST {group_id, 1024 entries}
+      S->>R: GROUP_MANIFEST {group_id, first_file_id, ≤1024 entries}
       R->>R: stat + digest destination
       R->>S: GROUP_DECISION {needed indices}
       R->>S: CREDIT {+1}
@@ -456,7 +456,7 @@ via `CHANNEL_JOIN` up to the sender-advertised maximum (§13.4).
 | Socket buffers | default | `--socket-buffer`, default 4 MiB |
 | Record size | ≤ 256 KiB | `--chunk-size`, default 1 MiB |
 | Loss is | fatal → suspend + resume (`REQ-NET-009`) | recoverable → requeue + rejoin (`REQ-NET-008`) |
-| Keepalive | `PING`/`PONG` every 15 s idle, dead at 45 s | inherits liveness from control |
+| Keepalive | `PING`/`PONG` every 15 s idle, dead at 45 s | no `PING`; each blocking receive is bounded by `--stall-timeout` (default 60 s) |
 
 ### 7.2 Candidate racing
 
@@ -477,10 +477,11 @@ ERROR  cannot reach sender  code=E3001 session=8f3a2c1d
 
 | Loss | Detection | Response |
 |---|---|---|
-| Data channel closes / errors | read/write error or keepalive gap | In-flight `request_id` marked failed-retryable; its file returns to the head of the need queue; the channel worker attempts `CHANNEL_JOIN` up to 3 times with backoff (0.5 s, 2 s, 8 s); on exhaustion the channel is retired and `N` is decremented. Session continues while `N ≥ 1`. |
+| Data channel closes / errors | read/write error | In-flight `request_id` marked failed-retryable; its file returns to the head of the need queue; the channel worker attempts `CHANNEL_JOIN` up to 3 times with backoff (0.5 s, 2 s, 8 s); on exhaustion the channel is retired and `N` is decremented. Session continues while `N ≥ 1`. |
+| Data channel half-open (a `FILE_REQUEST` accepted, then no `FILE_HEADER` / `FILE_CHUNK` / `FILE_COMPLETE` for `--stall-timeout`) | per-receive read deadline in the fetcher | The fetcher fails the session with `E3005` (fatal, resumable). The control channel's keepalive does not cover this case — a wedged sender still answers `PING` — so the data path has its own bound. |
 | Last data channel retired | `N` reaches 0 | Fatal `E3005`. |
 | Control channel closes | read error / keepalive timeout | Session enters `Suspended`. The receiver re-dials for `--resume-window` (default 60 s) and, on success, performs a fresh handshake; because the pairing code is single-use, resumption reuses the **existing session's** `K_chan` via a `SESSION_RESUME` control frame authenticated by `HMAC(K_chan, "resume" || session_id || nonce)`. On expiry: `E3004`, receiver exits `2` retaining its journal, sender exits `2`. |
-| Half-open TCP (peer powered off) | keepalive | Same as close. |
+| Half-open TCP (peer powered off) | control keepalive; data `--stall-timeout` | Same as close. |
 
 > **Note.** `SESSION_RESUME` reuses key material from the original handshake and therefore does **not**
 > re-derive forward secrecy. This is an accepted, bounded exposure: the window is 60 s and the keys
@@ -590,7 +591,7 @@ message type, the current state, and the channel, send `ERROR`, and terminate (`
 str  root_name          basename of the source path, for the receiver's default destination
 u8   source_kind        0 = directory, 1 = single file
 u8   hash_alg           0 = MD5 (default), 1 = BLAKE3, 2 = SHA-256
-u32  group_size         1024
+u64  group_bytes        target group size in bytes (--group-bytes; default 512 MiB), advisory
 u32  flags              bit0 follow_symlinks, bit1 one_file_system,
                         bit2 quick_mode, bit3 preserve_owner, bit4 hardlink_detection,
                         bit5 keep_system_files
@@ -633,7 +634,7 @@ bytes manifest_digest      32 bytes; see §10.5
 **`0x12 GROUP_MANIFEST`**
 ```
 u32  group_id
-u64  first_file_id        == group_id * 1024
+u64  first_file_id        file id of this group's first entry (groups are size-based, §10.4)
 u16  entry_count          1..1024
      entry_count × ManifestEntry:
        u8    entry_type        0 = file, 1 = dir, 2 = symlink
@@ -932,13 +933,26 @@ including panic and signal.
 ### 10.4 Grouping
 
 ```
-file_id  = index in the sorted order, zero-based
-group_id = file_id / 1024
+file_id = index in the sorted order, zero-based
+
+walk the sorted entries once, opening a new group when the current one is
+non-empty and either:
+  - it already holds GROUP_ENTRY_CAP (1024) entries, or
+  - adding this entry's file size would push the group past GROUP_BYTES.
 ```
-Groups are therefore contiguous ranges of file ids; group membership never needs to be transmitted
-(`REQ-SCAN-024`). Directories and symlinks occupy ids and group slots exactly like regular files —
-they are entries in the plan, so that "1024 files per group" is a statement about the plan and not
-about a subset of it. The last group holds `total_files mod 1024` entries (or 1024).
+`GROUP_BYTES` is `--group-bytes` (default 512 MiB). Groups are contiguous ranges of file ids, so
+group membership never needs to be transmitted (`REQ-SCAN-024`); the range boundaries are carried
+explicitly as `GROUP_MANIFEST.first_file_id`. Directories and symlinks occupy ids and group slots
+exactly like regular files (they count as zero bytes toward `GROUP_BYTES`) — they are entries in the
+plan, so the entry cap is a statement about the plan and not about a subset of it.
+
+A single file larger than `GROUP_BYTES` forms its own group: the target only *closes* a group, it
+never splits one entry across groups, and the entry cap still bounds `GROUP_MANIFEST` size.
+
+`--group-bytes` is a pure transport-tuning knob: it is deliberately **not** folded into the manifest
+digest (§10.5), so re-running with a different value does not invalidate a resume journal. The
+grouping algorithm change from fixed-1024 to size-based is instead covered by the `protocol_version`
+bump (1 → 2), which cleanly rejects cross-version pairing and stale journals.
 
 An empty tree yields zero groups and a session that goes straight to `Draining` (`REQ-SCAN-036`).
 A single-file source yields one group of one entry (`REQ-SCAN-037`).
@@ -947,11 +961,15 @@ A single-file source yields one group of one entry (`REQ-SCAN-037`).
 
 ```
 manifest_digest = SHA-256(
-    "esync/v1 manifest" || protocol_version || hash_alg || group_size || flags
+    "esync/v1 manifest" || protocol_version || hash_alg || u32(0) || flags
     || filter_signature || sysexclude_tag
     || for each entry in order: len(path) || path || type || size || mtime_sec || mtime_nsec
 )
 ```
+The `u32(0)` slot once held the fixed group size; grouping is now size-based (§10.4) and
+`--group-bytes` is intentionally excluded, so the slot is reserved-zero. Its position is retained so
+the fold layout is unchanged.
+
 This is a fingerprint of the *plan*, not of the content. It lets a resumed session detect that the
 source tree changed shape, and it is the artefact the determinism property test compares
 (`REQ-SCAN-020`, `REQ-VER-003`). It excludes digests so that it can be computed at the end of the
@@ -1263,9 +1281,23 @@ ascending so that progress is monotonic and comprehensible.
 
 The session is complete when: `groups_decided == total_groups` **and** the need queue is empty
 **and** every issued `request_id` has terminated (`INV-7`). Only then does the sender send
-`SESSION_SUMMARY`. A watchdog asserts that this condition, once reachable, is reached within
-`--drain-timeout` (default 60 s); exceeding it is `E9002` (an internal accounting bug) and is fatal
-rather than a hang (`REQ-NET-010`).
+`SESSION_SUMMARY`. A watchdog asserts that the condition is reached, and exceeding it is `E9002` —
+the transfer stopped moving with work still outstanding (typically the peer or the link went quiet)
+— fatal rather than a hang (`REQ-NET-010`), and resumable from the journal.
+
+The two sides arm that watchdog differently, because only the receiver knows when termination has
+become *reachable*. The receiver does: it waits for its decide pool to finish **and** its need queue
+to drain (no queued items, none in flight), and from that point `--drain-timeout` (default 60 s)
+bounds the remaining channel unwind.
+
+The sender does not. It never learns when the receiver has stopped issuing `FILE_REQUEST`s — there
+is no such R→S message — and `groups_decided == total_groups` is **not** a usable proxy for it: the
+receiver emits `GROUP_DECISION` at the head of its decision pass, before that group's needed files
+are enqueued and long before they are requested, so under backpressure the last decision can precede
+the last request by many minutes. Arming a deadline there aborts healthy transfers. The sender's
+watchdog therefore bounds **inactivity** rather than the tail's duration: once every group is
+decided, `E9002` fires only after a full `--drain-timeout` in which no request started, ended, or
+streamed a chunk. A live session is never interrupted; a genuinely stuck one still fails fast.
 
 ---
 
@@ -1321,7 +1353,7 @@ Fault {
 | **E3002** | Fatal | – | Connect timeout on all candidates | As `E3001` |
 | **E3003** | Item→Fatal | yes | Connection reset mid-session | Automatic: requeue and rejoin; fatal if the control channel and resume fails |
 | **E3004** | Fatal | – | Peer unresponsive past the keepalive deadline | Check the other machine; resume with the same command |
-| **E3005** | Fatal | – | All data channels lost and unrecoverable | Re-run; the receiver resumes from its journal |
+| **E3005** | Fatal | – | A data channel is lost, idle past `--stall-timeout`, or the last one retired | Re-run; the receiver resumes from its journal |
 | **E3006** | Item | yes | `CHANNEL_JOIN` rejected | Automatic retry; channel retired on exhaustion |
 | **E3007** | Fatal | – | Control channel resume window expired | Re-run; the receiver resumes from its journal |
 | **E4001** | Fatal | – | Handshake confirmation MAC failed | The code is wrong or a MITM is present (exit `4`) |
@@ -1370,7 +1402,7 @@ Fault {
 | **E8004** | Warn | – | Journal record corrupt (torn tail) | Automatic: the record is discarded, its file is re-fetched |
 | **E8005** | Warn | – | Digest cache corrupt or version-mismatched | Automatic: full hashing is used |
 | **E9001** | Fatal | – | Panic recovered at a worker boundary | A defect; the stack trace and the trace-ring dump are in the log |
-| **E9002** | Fatal | – | Drain watchdog expired | An accounting defect; report with the log |
+| **E9002** | Fatal | – | The transfer stopped making progress with work still outstanding | The peer or network went quiet; check the other machine and the link, then re-run to resume from the journal |
 | **E9003** | Fatal | – | Runtime invariant violated (§9.4) | A defect; report with the log |
 | **E9004** | Fatal | – | A bound was exceeded that should have been unreachable | A defect; report with the log |
 
@@ -1592,21 +1624,30 @@ with `file=<id>` for sharing logs.
 
 ### 15.10 Progress rendering
 
-`REQ-CLI-006`, `REQ-CLI-007`. Progress is a separate sink from logging, on stderr:
+`REQ-CLI-006`, `REQ-CLI-007`. Progress is a separate sink from logging, on stderr, wired up by
+both `sender.Run` and `receiver.Run` (`internal/obs.Progress`, fed once per `--progress-interval`
+from live counters). On a TTY it repaints a single status line:
 
 ```
-  Documents  ▐████████████████████░░░░░░░░░░▌  61.8/94.2 GiB   31,004/48,219 files
-             73.4 MiB/s   12 channels   group 31/48   eta 07:31
+  61.8 GiB / 94.2 GiB   31004 / 48219 files   73.4 MB/s   eta 7:31
 ```
 
-On a non-TTY stderr, the renderer emits one `INFO` line every `--progress-interval` (default 5 s)
+The totals are the receiver's running sum of what its decider has determined is actually needed
+(files already present or rejected are excluded), so they grow group by group as the manifest is
+consumed and are shown as just the done figure (`61.8 GiB   31004 files   73.4 MB/s`) until the
+first group is decided. `eta` is shown only once a total is known and the rate is non-zero. The rate
+is `Δbytes` over the render interval, exponentially smoothed. The sender does not know which files
+the receiver will skip, so it renders bytes and files sent, and rate, with no total and no eta.
+
+On a non-TTY stderr, the renderer emits one plain line every `--progress-interval` (default 5 s)
 instead of any control sequences, so piped and CI output stays clean.
 
 ### 15.11 Heartbeat
 
-`internal/obs.Heartbeat`, started by both `sender.Run` and `receiver.Run`. Independent of the
-`Progress` renderer in §15.10 (neither side currently wires that renderer up): every 60 s it emits
-one `INFO` line naming which groups are still in flight, the live data-channel count, and the
+`internal/obs.Heartbeat`, started by both `sender.Run` and `receiver.Run`, independent of the
+`Progress` renderer in §15.10: it goes to the log rather than the stderr progress sink, and every
+60 s emits one `INFO` line naming which groups are still in flight, the live data-channel count, and
+the
 transfer rate averaged over the trailing 10 s sample window, in decimal (SI) units:
 
 ```
@@ -1668,6 +1709,7 @@ file — that would violate `P8`/`REQ-NFR-003`.
 | `--keep-system-files` | off | `SCAN-027` |
 | `--include <glob>` / `--exclude <glob>` | none | `CLI-011` |
 | `--hash-workers <n>` | `min(8, NumCPU)` | `HASH-009` |
+| `--group-bytes <n>` | 512 MiB | `SCAN-024` |
 | `--read-concurrency <n>` | 4 | `PAR-002` |
 | `--spill-threshold <n>` | 500,000 | `SCAN-033` |
 
@@ -1687,6 +1729,7 @@ file — that would violate `P8`/`REQ-NFR-003`.
 | `--checkpoint-interval <bytes>` | 64 MiB | `XFER-041` |
 | `--resume-window <d>` | 60 s | `NET-009` |
 | `--drain-timeout <d>` | 60 s | §13.7 |
+| `--stall-timeout <d>` | 60 s | §7.3 |
 | `--allow-unsafe-links` | off | `FS-043` |
 | `--owner` | off | `FS-010` |
 
@@ -2000,7 +2043,7 @@ First-class capability, not an afterthought (`REQ-VER-005`). Faults are injected
 | `F-NET-02` | Control channel killed mid-session | Suspend → resume within the window, or `E3007` and a resumable journal |
 | `F-NET-03` | Connection closed without an authenticated close | `E4005`, never reported as success |
 | `F-NET-04` | Record replayed / reordered / dropped | `E4004`, session aborts |
-| `F-NET-05` | Peer stops responding but the socket stays open | `E3004` at the keepalive deadline, no hang |
+| `F-NET-05` | Peer stops responding but the socket stays open | `E3004` at the keepalive deadline (control) / `E3005` at `--stall-timeout` (data), no hang |
 | `F-NET-06` | Peer sends `ERROR` | Both logs record the same code and cause |
 | `F-XFER-01` | Corrupted bytes on the wire past the MAC (simulated at the writer) | `E8001`, retried, then failed cleanly |
 | `F-XFER-02` | Kill the receiver between write and rename | No partial file at the final path; resume completes it |

@@ -121,8 +121,9 @@ func sign(n int) int {
 	}
 }
 
-// T-SCAN-02: grouping math. file_id = sorted index, group_id = file_id/1024,
-// last group holds the remainder; empty -> 0 groups, 1 -> 1 group of 1.
+// T-SCAN-02: grouping math. file_id = sorted index; groups are packed to a byte
+// target but never exceed maxGroupEntries entries; the last group holds the
+// remainder. Empty -> 0 groups, 1 -> 1 group of 1.
 func TestGroupingMath(t *testing.T) {
 	if g := mustBuild(t, nil).NumGroups(); g != 0 {
 		t.Fatalf("empty input: NumGroups = %d, want 0", g)
@@ -131,6 +132,7 @@ func TestGroupingMath(t *testing.T) {
 		t.Fatalf("one entry: NumGroups = %d, want 1", g)
 	}
 
+	// Many tiny files well under the byte target: the 1024-entry cap splits them.
 	var es []Entry
 	const n = 2050
 	for i := 0; i < n; i++ {
@@ -144,12 +146,44 @@ func TestGroupingMath(t *testing.T) {
 		t.Fatalf("group sizes = %d/%d/%d, want 1024/1024/2", len(p.Group(0)), len(p.Group(1)), len(p.Group(2)))
 	}
 	id, ok := p.FileID("f/000000")
-	if !ok || id != 0 || GroupID(id) != 0 {
-		t.Fatalf("FileID(f/000000) = %d,%v groupID %d", id, ok, GroupID(id))
+	if !ok || id != 0 || p.GroupID(id) != 0 {
+		t.Fatalf("FileID(f/000000) = %d,%v groupID %d", id, ok, p.GroupID(id))
 	}
 	id, _ = p.FileID("f/002049")
-	if id != 2049 || GroupID(id) != 2 {
-		t.Fatalf("FileID(f/002049) = %d groupID %d, want 2049/2", id, GroupID(id))
+	if id != 2049 || p.GroupID(id) != 2 || p.GroupFirstID(2) != 2048 {
+		t.Fatalf("FileID(f/002049) = %d groupID %d first %d, want 2049/2/2048", id, p.GroupID(id), p.GroupFirstID(2))
+	}
+}
+
+// T-SCAN-02: the byte target closes a group before the entry cap when files are
+// large, and an oversize single file forms its own group. Files sort as
+// a,b,big,c,d by name.
+func TestGroupingBySize(t *testing.T) {
+	const mib = 1 << 20
+	es := []Entry{
+		fileEntry("a", 200*mib, 1),   // group 0
+		fileEntry("b", 200*mib, 1),   // group 0 (a+b = 400 MiB <= 512)
+		fileEntry("big", 900*mib, 1), // group 1 (400+900 > 512): oversize, alone
+		fileEntry("c", 300*mib, 1),   // group 2 (900+300 > 512)
+		fileEntry("d", 300*mib, 1),   // group 3 (300+300 > 512)
+	}
+	p, err := Build(es, Options{GroupBytes: 512 * mib})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.NumGroups() != 4 {
+		t.Fatalf("NumGroups = %d, want 4", p.NumGroups())
+	}
+	got := []int{len(p.Group(0)), len(p.Group(1)), len(p.Group(2)), len(p.Group(3))}
+	if got[0] != 2 || got[1] != 1 || got[2] != 1 || got[3] != 1 {
+		t.Fatalf("group sizes = %v, want [2 1 1 1]", got)
+	}
+	firsts := p.GroupFirsts()
+	if len(firsts) != 4 || firsts[0] != 0 || firsts[1] != 2 || firsts[2] != 3 || firsts[3] != 4 {
+		t.Fatalf("GroupFirsts = %v, want [0 2 3 4]", firsts)
+	}
+	if p.GroupID(2) != 1 || p.GroupID(4) != 3 {
+		t.Fatalf("GroupID(2)=%d GroupID(4)=%d, want 1/3", p.GroupID(2), p.GroupID(4))
 	}
 }
 

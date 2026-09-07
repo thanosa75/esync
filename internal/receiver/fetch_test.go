@@ -254,6 +254,75 @@ func TestFetchManifestDigestMismatch(t *testing.T) {
 	}
 }
 
+// T-XFER: a data channel that accepts a FILE_REQUEST and then goes silent must
+// not hang the fetcher. The per-receive stall timeout trips E3005 (fatal,
+// resumable) so the session can end and be re-run from the journal.
+func TestFetchStallTimeout(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+	h.f.stall = 150 * time.Millisecond
+
+	data := make([]byte, 4096)
+	dig := md5sum(t, data)
+
+	// The fake sender takes the request and never answers.
+	go func() { _, _ = sConn.RecvMsg() }()
+
+	h.enqueue(t, 0, "stall.bin", data, dig)
+	h.q.close()
+
+	done := make(chan struct{})
+	go func() { h.f.loop(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch loop hung past the stall timeout")
+	}
+
+	e, _ := h.failErr.Load().(error)
+	if fault.GetCode(e) != fault.E3005 {
+		t.Fatalf("fail error = %v, want E3005", e)
+	}
+}
+
+// The stall timeout also fires mid-file: the header arrives, then the chunk
+// stream stops.
+func TestFetchStallTimeoutMidStream(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+	h.f.stall = 150 * time.Millisecond
+
+	data := make([]byte, 200000)
+	dig := md5sum(t, data)
+
+	go func() {
+		m, err := sConn.RecvMsg()
+		if err != nil {
+			return
+		}
+		req := m.(*wire.FileRequest)
+		_ = sConn.SendMsg(&wire.FileHeader{RequestID: req.RequestID, FileID: req.FileID, Size: uint64(len(data)), Digest: dig, ChunkSize: 1 << 16})
+		_ = sConn.SendMsg(&wire.FileChunk{RequestID: req.RequestID, Offset: 0, Data: data[:1000]})
+		// then silence
+	}()
+
+	h.enqueue(t, 0, "stall-mid.bin", data, dig)
+	h.q.close()
+
+	done := make(chan struct{})
+	go func() { h.f.loop(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch loop hung past the stall timeout")
+	}
+
+	e, _ := h.failErr.Load().(error)
+	if fault.GetCode(e) != fault.E3005 {
+		t.Fatalf("fail error = %v, want E3005", e)
+	}
+}
+
 // A chunk that arrives at the wrong offset is a fatal protocol fault (E5006).
 func TestFetchFatalOnOffsetGap(t *testing.T) {
 	sConn, rConn := connPair(t, 1)

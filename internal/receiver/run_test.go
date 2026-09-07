@@ -45,6 +45,12 @@ type fakeSender struct {
 	chunkDelay time.Duration
 	chunkSize  int
 
+	// abortBeforeSummary, when set, makes the fake sender abandon the session
+	// once every needed file has been served but before SESSION_SUMMARY:
+	// "error" sends a fatal wire.Error then closes the control channel, "close"
+	// just closes it. Models a sender that crashed or tripped its own watchdog.
+	abortBeforeSummary string
+
 	mu       sync.Mutex
 	needed   map[uint64]bool
 	served   map[uint64]bool
@@ -54,7 +60,7 @@ type fakeSender struct {
 	joined   int // total CHANNEL_JOINs accepted, initial batch + any later ramp-ups
 }
 
-func newFakeSender(t *testing.T, files []treeFile) *fakeSender {
+func newFakeSender(t *testing.T, files []treeFile, opts ...func(*fakeSender)) *fakeSender {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -69,6 +75,9 @@ func newFakeSender(t *testing.T, files []treeFile) *fakeSender {
 	fs := &fakeSender{
 		t: t, ln: ln, link: code, files: files, errc: make(chan error, 4),
 		needed: map[uint64]bool{}, served: map[uint64]bool{},
+	}
+	for _, o := range opts {
+		o(fs)
 	}
 	t.Cleanup(func() { ln.Close() })
 	go fs.serve(secret)
@@ -101,7 +110,7 @@ func (fs *fakeSender) serve(secret obs.Secret) {
 
 	digAll := sha256.Sum256([]byte("manifest"))
 	if err := ctrl.SendMsg(&wire.SessionParams{
-		RootName: "payload", HashAlg: 0, GroupSize: 1024, SenderVersion: "esync/test",
+		RootName: "payload", HashAlg: 0, GroupBytes: 512 << 20, SenderVersion: "esync/test",
 		MaxChannels: fakeSenderMaxChannels,
 	}); err != nil {
 		fs.fail(err)
@@ -286,6 +295,15 @@ func (fs *fakeSender) maybeSummary() {
 		}
 	}
 	fs.summSent = true
+	if fs.abortBeforeSummary != "" {
+		if fs.abortBeforeSummary == "error" {
+			_ = fs.ctrl.SendMsg(&wire.Error{
+				Code: 9002, Fatal: 1, Message: "drain watchdog", Detail: "the transfer stopped making progress",
+			})
+		}
+		_ = fs.ctrl.Close()
+		return
+	}
 	comp := fs.completionDigestLocked()
 	var bytesT uint64
 	for id := range fs.served {
@@ -407,6 +425,35 @@ func TestRunResumeNothingToDo(t *testing.T) {
 	}
 	if sum.FilesSkipped != 2 {
 		t.Fatalf("FilesSkipped = %d, want 2", sum.FilesSkipped)
+	}
+}
+
+// A sender that abandons the control channel after serving every file but
+// before SESSION_SUMMARY must not be reported as a clean success: the transfer
+// never reconciled, so Run exits non-zero and keeps the journal for resume.
+func TestRunSenderAbortsBeforeSummary(t *testing.T) {
+	for _, mode := range []string{"close", "error"} {
+		t.Run(mode, func(t *testing.T) {
+			files := []treeFile{{rel: "a.txt", data: []byte("alpha")}}
+			fs := newFakeSender(t, files, func(fs *fakeSender) { fs.abortBeforeSummary = mode })
+			dest := t.TempDir()
+
+			sum, exit := Run(obs.Ctx{}, Config{
+				Link: fs.link, Dest: dest, Channels: 1, ChannelsPinned: true,
+				HandshakeTimeout: 5 * time.Second, ConnectTimeout: 5 * time.Second,
+				DrainTimeout: 2 * time.Second,
+			})
+
+			if exit == 0 {
+				t.Fatalf("exit = 0 (outcome %s), want non-zero: the sender never sent SESSION_SUMMARY", sum.Outcome)
+			}
+			if _, err := os.Stat(filepath.Join(dest, ".esync")); os.IsNotExist(err) {
+				t.Fatalf(".esync journal must be retained for resume after an incomplete transfer")
+			}
+			if sum.ResumeCommand == "" {
+				t.Fatalf("want a resume command in the summary, got none")
+			}
+		})
 	}
 }
 

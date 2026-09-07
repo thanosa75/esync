@@ -152,6 +152,7 @@ func (s *servicer) serve(ctx context.Context, req *wire.FileRequest) error {
 				return err
 			}
 			sent += uint64(n)
+			s.tr.bump()
 		}
 		if rerr == io.EOF {
 			break

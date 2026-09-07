@@ -25,6 +25,9 @@ type Config struct {
 	MaxPairAttempts  int           // --max-pair-attempts (E2007)
 	HandshakeTimeout time.Duration // per-connection handshake deadline
 	DrainTimeout     time.Duration // --drain-timeout (E9002)
+	ProgressInterval time.Duration // --progress-interval: stderr progress cadence
+
+	GroupBytes int64 // --group-bytes: target group size; <= 0 uses the plan default
 
 	HashAlg         digest.Algo
 	HashWorkers     int
@@ -58,6 +61,12 @@ func (c Config) withDefaults() Config {
 	if c.DrainTimeout <= 0 {
 		c.DrainTimeout = 60 * time.Second
 	}
+	if c.ProgressInterval <= 0 {
+		c.ProgressInterval = 5 * time.Second
+	}
+	if c.GroupBytes <= 0 {
+		c.GroupBytes = 512 << 20 // keep in step with plan.defaultGroupBytes
+	}
 	if c.HashWorkers <= 0 {
 		c.HashWorkers = min(8, runtime.NumCPU())
 	}
@@ -74,7 +83,7 @@ func (c Config) withDefaults() Config {
 }
 
 func (c Config) planOptions() plan.Options {
-	return plan.Options{KeepSystemFiles: c.KeepSystemFiles, Filters: c.Filters}
+	return plan.Options{KeepSystemFiles: c.KeepSystemFiles, Filters: c.Filters, GroupBytes: c.GroupBytes}
 }
 
 func (c Config) sessionFlags() uint32 {

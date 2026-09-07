@@ -132,7 +132,7 @@ var catalogue = map[Code]policy{
 	E3002: {Fatal, false, "connect timeout on all candidates", "check LAN connectivity and firewall"},
 	E3003: {Item, true, "connection reset mid-session", "automatic: requeue and rejoin; fatal if the control channel and resume fails"},
 	E3004: {Fatal, false, "peer unresponsive past the keepalive deadline", "check the other machine; resume with the same command"},
-	E3005: {Fatal, false, "all data channels lost and unrecoverable", "re-run; the receiver resumes from its journal"},
+	E3005: {Fatal, false, "a data channel is lost, idle past the stall timeout, or the last one retired", "re-run; the receiver resumes from its journal"},
 	E3006: {Item, true, "CHANNEL_JOIN rejected", "automatic retry; channel retired on exhaustion"},
 	E3007: {Fatal, false, "control channel resume window expired", "re-run; the receiver resumes from its journal"},
 
@@ -187,7 +187,7 @@ var catalogue = map[Code]policy{
 	E8005: {Warn, false, "digest cache corrupt or version-mismatched", "automatic: full hashing is used"},
 
 	E9001: {Fatal, false, "panic recovered at a worker boundary", "a defect; the stack trace and the trace-ring dump are in the log"},
-	E9002: {Fatal, false, "drain watchdog expired", "an accounting defect; report with the log"},
+	E9002: {Fatal, false, "the transfer stopped making progress with work still outstanding", "the peer or network went quiet; check the other machine and the link, then re-run to resume from the journal"},
 	E9003: {Fatal, false, "runtime invariant violated (§9.4)", "a defect; report with the log"},
 	E9004: {Fatal, false, "a bound was exceeded that should have been unreachable", "a defect; report with the log"},
 

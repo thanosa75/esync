@@ -12,3 +12,6 @@
 
 # Editor / OS
 .DS_Store
+
+# Agent worktree artifacts (nested git worktrees; also trips check-goroutines)
+.claude/

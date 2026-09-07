@@ -312,6 +312,52 @@ func TestProgressNoDeadlock(t *testing.T) {
 	p.Stop() // idempotent
 }
 
+func TestProgressRenderLine(t *testing.T) {
+	var buf bytes.Buffer
+	p := newProgress(&buf, false, 10*time.Millisecond)
+
+	// Unknown totals: only the done figures plus a rate, no "/ total", no eta.
+	p.Update(2048, 0, 3, 0)
+	p.render()
+	if s := buf.String(); !strings.Contains(s, "2.0KiB") || strings.Contains(s, " / ") || strings.Contains(s, "eta") {
+		t.Fatalf("no-total line wrong: %q", s)
+	}
+
+	// Totals known and a rate established: "done / total" and an eta appear.
+	buf.Reset()
+	p.lastAt = time.Now().Add(-time.Second)
+	p.lastBytes = 0
+	p.Update(1<<20, 4<<20, 5, 20)
+	p.render()
+	s := buf.String()
+	if !strings.Contains(s, "1.0MiB / 4.0MiB") || !strings.Contains(s, "5 / 20 files") || !strings.Contains(s, "eta") {
+		t.Fatalf("with-total line wrong: %q", s)
+	}
+}
+
+func TestProgressFeed(t *testing.T) {
+	root, flush := Init(Config{Level: LevelInfo, Sync: true, Role: "receiver"})
+	defer flush()
+	var db, tf atomic.Int64
+	p := NewProgress(root, 5*time.Millisecond)
+	p.Feed(root, func() (int64, int64, int64, int64) {
+		return db.Load(), 0, 0, tf.Load()
+	})
+	db.Store(4096)
+	tf.Store(9)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.doneBytes.Load() == 4096 && p.totalFiles.Load() == 9 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.doneBytes.Load() != 4096 || p.totalFiles.Load() != 9 {
+		t.Fatalf("feed did not push samples: db=%d tf=%d", p.doneBytes.Load(), p.totalFiles.Load())
+	}
+	p.Stop()
+}
+
 // The heartbeat logs the caller-supplied groups (joined as given — sorting is
 // the caller's job, both real implementations already do it) and channel
 // count, plus a human-readable bandwidth figure, on the log cadence — not the
