@@ -227,6 +227,42 @@ func TestTrackerTerminationCondition(t *testing.T) {
 	}
 }
 
+// inProgressGroups reports only decided groups with an unresolved needed
+// file, and drops a group once every needed file is resolved.
+func TestTrackerInProgressGroups(t *testing.T) {
+	tr := newTracker(3)
+	if got := tr.inProgressGroups(); len(got) != 0 {
+		t.Fatalf("in progress before any decision = %v, want none", got)
+	}
+
+	// group 0 needs index 3 (file_id 3); group 1 needs index 0 of its range
+	// (file_id 1024); group 2 needs nothing.
+	if err := tr.decision(&wire.GroupDecision{GroupID: 0, Needed: []uint16{3}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.decision(&wire.GroupDecision{GroupID: 1, Needed: []uint16{0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.decision(&wire.GroupDecision{GroupID: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := tr.inProgressGroups()
+	want := []uint32{0, 1}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("in progress = %v, want %v", got, want)
+	}
+
+	tr.reqStarted(50, 3)
+	tr.reqCompleted(50, 3, 128)
+
+	got = tr.inProgressGroups()
+	want = []uint32{1}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("in progress after group 0 resolves = %v, want %v", got, want)
+	}
+}
+
 // A duplicate GROUP_DECISION for one group is E5009.
 func TestTrackerDuplicateDecision(t *testing.T) {
 	tr := newTracker(1)

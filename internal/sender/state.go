@@ -237,6 +237,27 @@ func (t *tracker) wait(ctx context.Context, drainTimeout time.Duration) error {
 	}
 }
 
+// inProgressGroups returns the ascending ids of groups that have been decided
+// but still have at least one needed file not yet resolved (completed,
+// permanently failed, or cancelled) — the set the periodic heartbeat
+// (obs.Heartbeat) reports as "in progress".
+func (t *tracker) inProgressGroups() []uint32 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	set := map[uint32]struct{}{}
+	for fid := range t.needed {
+		if !t.resolved[fid] {
+			set[uint32(fid/groupEntries)] = struct{}{}
+		}
+	}
+	ids := make([]uint32, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
 func (t *tracker) completionDigest() [32]byte {
 	t.mu.Lock()
 	ids := append([]uint64(nil), t.completed...)

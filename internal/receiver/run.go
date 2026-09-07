@@ -581,6 +581,8 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 				return nil
 			})
 		}
+		hb := obs.NewHeartbeat(octx, 0, 0, q.inProgressGroups, s.channelCount)
+		defer hb.Stop()
 	}
 
 	done := make(chan struct{})

@@ -311,3 +311,63 @@ func TestProgressNoDeadlock(t *testing.T) {
 	p.Stop()
 	p.Stop() // idempotent
 }
+
+// The heartbeat logs the caller-supplied groups (joined as given — sorting is
+// the caller's job, both real implementations already do it) and channel
+// count, plus a human-readable bandwidth figure, on the log cadence — not the
+// (finer) sample cadence.
+func TestHeartbeatLogsGroupsChannelsRate(t *testing.T) {
+	var buf bytes.Buffer
+	ctx, l := newTestCtx(Config{Format: "text", Level: LevelInfo, Sync: true, Role: "sender"}, &buf)
+	groups := func() []uint32 { return []uint32{1, 2, 3} }
+	channels := func() int { return 4 }
+
+	h := NewHeartbeat(ctx, 5*time.Millisecond, 10*time.Millisecond, groups, channels)
+	l.counters.Bytes.Add(1024)
+	time.Sleep(40 * time.Millisecond)
+	h.Stop()
+	h.Stop() // idempotent
+
+	out := buf.String()
+	if !strings.Contains(out, "groups in progress") {
+		t.Fatalf("missing heartbeat line:\n%s", out)
+	}
+	if !strings.Contains(out, "groups=1,2,3") {
+		t.Fatalf("groups not formatted correctly:\n%s", out)
+	}
+	if !strings.Contains(out, "channels=4") {
+		t.Fatalf("missing channel count:\n%s", out)
+	}
+	if !strings.Contains(out, "B/s") {
+		t.Fatalf("missing human rate:\n%s", out)
+	}
+}
+
+func TestHeartbeatNoGroups(t *testing.T) {
+	var buf bytes.Buffer
+	ctx, _ := newTestCtx(Config{Format: "text", Level: LevelInfo, Sync: true, Role: "receiver"}, &buf)
+	h := NewHeartbeat(ctx, 5*time.Millisecond, 10*time.Millisecond, func() []uint32 { return nil }, func() int { return 0 })
+	time.Sleep(20 * time.Millisecond)
+	h.Stop()
+
+	if !strings.Contains(buf.String(), "groups=none") {
+		t.Fatalf("empty groups should render as \"none\":\n%s", buf.String())
+	}
+}
+
+func TestHumanRate(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{0, "0 B/s"},
+		{999, "999 B/s"},
+		{1500, "1.5 KB/s"},
+		{42_300_000, "42.3 MB/s"},
+	}
+	for _, c := range cases {
+		if got := humanRate(c.in); got != c.want {
+			t.Errorf("humanRate(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

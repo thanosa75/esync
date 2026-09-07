@@ -19,7 +19,7 @@ func drainAll(t *testing.T, q *needQueue) []uint64 {
 			return out
 		}
 		out = append(out, it.fileID)
-		q.done()
+		q.done(it.groupID)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestQueueBoundedNeverDropsNeverDoubleYields(t *testing.T) {
 			t.Fatal("pop returned !ok early")
 		}
 		seen[it.fileID]++
-		q.done()
+		q.done(it.groupID)
 	}
 	select {
 	case <-pushed:
@@ -117,7 +117,7 @@ func TestQueueBoundedNeverDropsNeverDoubleYields(t *testing.T) {
 			t.Fatalf("depth %d exceeded capacity %d", d, cap)
 		}
 		seen[it.fileID]++
-		q.done()
+		q.done(it.groupID)
 	}
 	for id := uint64(1); id <= 6; id++ {
 		if seen[id] != 1 {
@@ -144,10 +144,52 @@ func TestQueueRequeue(t *testing.T) {
 	if !ok || it2.fileID != 7 || it2.attempt != 1 {
 		t.Fatalf("second pop = %+v, %v", it2, ok)
 	}
-	q.done()
+	q.done(it2.groupID)
 
 	if _, ok := q.pop(context.Background()); ok {
 		t.Fatal("queue should be drained")
+	}
+}
+
+// inProgressGroups reports only groups with an item not yet done(), and drops
+// a group once every one of its items is done() — regardless of retries in
+// between (requeue must not clear a group's pending count).
+func TestQueueInProgressGroups(t *testing.T) {
+	q := newNeedQueue(64)
+	if got := q.inProgressGroups(); len(got) != 0 {
+		t.Fatalf("in progress before any push = %v, want none", got)
+	}
+
+	_ = q.pushGroup(context.Background(), []needItem{{fileID: 1, groupID: 5, size: 1}, {fileID: 2, groupID: 5, size: 2}})
+	_ = q.pushGroup(context.Background(), []needItem{{fileID: 3, groupID: 9, size: 1}})
+
+	got := q.inProgressGroups()
+	want := []uint32{5, 9}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("in progress = %v, want %v", got, want)
+	}
+
+	// pop and requeue one item of group 5: still in progress, not dropped.
+	it, ok := q.pop(context.Background())
+	if !ok || it.groupID != 5 {
+		t.Fatalf("first pop = %+v, %v", it, ok)
+	}
+	q.requeue(it)
+	if got := q.inProgressGroups(); len(got) != 2 {
+		t.Fatalf("in progress after requeue = %v, want 2 groups still pending", got)
+	}
+
+	// drain everything: every group should disappear as its last item is done().
+	q.close()
+	for {
+		it, ok := q.pop(context.Background())
+		if !ok {
+			break
+		}
+		q.done(it.groupID)
+	}
+	if got := q.inProgressGroups(); len(got) != 0 {
+		t.Fatalf("in progress after full drain = %v, want none", got)
 	}
 }
 

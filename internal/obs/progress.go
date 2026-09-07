@@ -98,3 +98,22 @@ func humanBytes(n int64) string {
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
+
+// humanRate renders a bytes/sec rate in decimal (SI) units — B/s, KB/s,
+// MB/s, ... — the convention bandwidth is normally reported in, unlike
+// humanBytes above which uses binary units for on-disk sizes.
+func humanRate(bytesPerSec float64) string {
+	if bytesPerSec < 0 {
+		bytesPerSec = 0
+	}
+	const unit = 1000.0
+	if bytesPerSec < unit {
+		return fmt.Sprintf("%.0f B/s", bytesPerSec)
+	}
+	div, exp := unit, 0
+	for n := bytesPerSec / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB/s", bytesPerSec/div, "KMGTPE"[exp])
+}

@@ -33,10 +33,15 @@ type needQueue struct {
 
 	pushed  uint64
 	yielded uint64
+
+	// pending counts, per group, the needed files not yet terminally resolved
+	// (a group's entry is removed once it reaches zero). Reported by
+	// inProgressGroups for the periodic heartbeat (obs.Heartbeat).
+	pending map[uint32]int
 }
 
 func newNeedQueue(capacity int) *needQueue {
-	q := &needQueue{capacity: capacity}
+	q := &needQueue{capacity: capacity, pending: map[uint32]int{}}
 	q.notEmpty = sync.NewCond(&q.mu)
 	q.notFull = sync.NewCond(&q.mu)
 	return q
@@ -72,6 +77,7 @@ func (q *needQueue) pushGroup(ctx context.Context, items []needItem) error {
 	}
 	q.items = append(q.items, sorted...)
 	q.pushed += uint64(len(sorted))
+	q.pending[sorted[0].groupID] += len(sorted)
 	q.notEmpty.Broadcast()
 	return nil
 }
@@ -120,16 +126,37 @@ func (q *needQueue) pop(ctx context.Context) (needItem, bool) {
 }
 
 // done marks one popped item as terminally resolved (published or permanently
-// failed).
-func (q *needQueue) done() {
+// failed). groupID is the resolved item's group, for the pending count that
+// inProgressGroups reports.
+func (q *needQueue) done(groupID uint32) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.inflight > 0 {
 		q.inflight--
 	}
+	if q.pending[groupID] > 0 {
+		q.pending[groupID]--
+		if q.pending[groupID] == 0 {
+			delete(q.pending, groupID)
+		}
+	}
 	if len(q.items) == 0 && q.closed && q.inflight == 0 {
 		q.notEmpty.Broadcast()
 	}
+}
+
+// inProgressGroups returns the ascending ids of groups with at least one
+// needed file not yet terminally resolved — the set the periodic heartbeat
+// (obs.Heartbeat) reports as "in progress".
+func (q *needQueue) inProgressGroups() []uint32 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	ids := make([]uint32, 0, len(q.pending))
+	for id := range q.pending {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // close signals that no further groups will be pushed. pop drains what remains.

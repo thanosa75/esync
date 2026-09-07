@@ -55,6 +55,53 @@ MFR-0004 · <area> · <the rule, imperative> — <why: the bug it prevents>
 
 ## Session Log
 
+### 2026-09-07 — 60s groups/channels/bandwidth heartbeat
+
+- User request: "every 60s you should emit which groups are in progress ...
+  add also channels and bandwidth averaged on the 10s interval, in human
+  readable". Clarified via question: heartbeat runs on **both** sender and
+  receiver; user noted the existing `Progress` renderer (§15.10) isn't wired
+  up on either side, so this is a new, independent mechanism rather than an
+  extension of it — see ARCHITECTURE §15.11.
+- New `internal/obs/heartbeat.go`: `Heartbeat`/`NewHeartbeat(ctx,
+  sampleInterval, logInterval, groups func() []uint32, channels func() int)`
+  samples `ctx.Counters().Bytes` every 10s (default) to compute a trailing-
+  window rate, logs at INFO every 60s (default): `groups=<ascending ids or
+  "none"> channels=<n> rate=<humanRate>`. `Stop()` is synchronous (closes a
+  `done` channel the loop goroutine closes on exit) so callers can safely
+  read shared state (e.g. a test's log buffer) right after — an earlier
+  fire-and-forget `Stop()` raced the loop's final possible log write under
+  `-race`.
+- New `humanRate` in `progress.go`: decimal (SI, base-1000) B/s→KB/s→MB/s...,
+  deliberately distinct from `humanBytes` (binary, base-1024, for on-disk
+  sizes) — matches how bandwidth is conventionally reported and the user's
+  literal "MB/sec, KB/sec" phrasing.
+- "In progress" derivation differs per side because sender and receiver
+  track group/file state differently: sender's `tracker.inProgressGroups()`
+  (`state.go`) reads the pre-existing `needed`/`resolved` maps (file ids ÷
+  1024 = group id), no new state. Receiver's `needQueue` had no per-group
+  bookkeeping at all, so `queue.go` gained a `pending map[uint32]int`
+  incremented in `pushGroup` and decremented in `done`, which changed
+  `done()`'s signature to `done(groupID uint32)` — updated all 5 call sites
+  in `fetch.go` and the pre-existing calls in `queue_test.go`.
+- Channel counts: receiver reused the existing `session.channelCount()`.
+  Sender had no equivalent, so `run.go` gained a package-level-scoped
+  `activeChannels atomic.Int64` incremented/decremented around each
+  servicer's lifecycle in `startServicer`.
+- Wired in: `sender/run.go` after the manifest goroutine starts (before the
+  termination wait); `receiver/run.go` inside the existing `if
+  !cfg.DryRun` block, alongside the per-channel `registerAndStart` calls.
+  Both use `defer hb.Stop()`.
+- Full gate green: `gofmt -l .` clean, `go vet ./...` clean, `go build
+  ./...`, `go test -race ./...` all packages, `make check-goroutines` clean
+  (heartbeat goroutine goes through `obs.Go` like everything else),
+  `make cover-check` 84.1% (min 80%; `internal/sender` alone shows 39.1% in
+  isolation but that's pre-existing — `Run()`/`walk.go` are mainly covered
+  by e2e tests, not unit tests, and this change didn't touch that balance).
+- Not done (not requested, and would violate surgical-changes): wiring up
+  the existing `Progress` renderer, or extending `--progress-interval` to
+  cover this — the heartbeat is a separate, always-on mechanism.
+
 ### 2026-09-07 — Fix: receiver drain watchdog fires mid-transfer (E9002)
 
 - Diagnosed from a real sender/receiver log pair the user pasted: a

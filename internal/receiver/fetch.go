@@ -49,16 +49,16 @@ func (f *fetcher) loop(ctx context.Context) {
 		}
 		err := f.fetchOne(ctx, it)
 		if err == nil {
-			f.q.done()
+			f.q.done(it.groupID)
 			continue
 		}
 		if ctx.Err() != nil {
-			f.q.done()
+			f.q.done(it.groupID)
 			return
 		}
 		if fault.IsFatal(err) {
 			f.fail(err)
-			f.q.done()
+			f.q.done(it.groupID)
 			return
 		}
 		if fault.IsRetryable(err) && it.attempt+1 <= f.cfg.MaxRetries {
@@ -68,7 +68,7 @@ func (f *fetcher) loop(ctx context.Context) {
 			select {
 			case <-time.After(fault.Backoff(it.attempt, f.rnd)):
 			case <-ctx.Done():
-				f.q.done()
+				f.q.done(it.groupID)
 				return
 			}
 			it.attempt++
@@ -77,7 +77,7 @@ func (f *fetcher) loop(ctx context.Context) {
 		}
 		obs.LogFault(f.octx, err)
 		f.counters.FilesFailed.Add(1)
-		f.q.done()
+		f.q.done(it.groupID)
 	}
 }
 

@@ -268,6 +268,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 
 	readSem := make(chan struct{}, cfg.ReadConcurrency)
 	entries := pl.Entries()
+	var activeChannels atomic.Int64
 	startServicer := func(dc *channel.Conn) {
 		s := &servicer{
 			ctx:       obs.With(octx, obs.F("chan", int(dc.ID()))),
@@ -280,7 +281,9 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 			digests:   ds,
 			tr:        tr,
 		}
+		activeChannels.Add(1)
 		obs.Go(octx, "servicer", func() error {
+			defer activeChannels.Add(-1)
 			if err := s.run(rootCtx); err != nil {
 				if rootCtx.Err() == nil {
 					setFatal(fault.Wrap(fault.E3005, "data channel", "", err))
@@ -344,6 +347,9 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		}
 		return nil
 	})
+
+	hb := obs.NewHeartbeat(octx, 0, 0, tr.inProgressGroups, func() int { return int(activeChannels.Load()) })
+	defer hb.Stop()
 
 	// --- 10. wait for termination, then drain -----------------------
 	drainEnd := obs.Start(ctx, "drain")

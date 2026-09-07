@@ -1602,6 +1602,26 @@ with `file=<id>` for sharing logs.
 On a non-TTY stderr, the renderer emits one `INFO` line every `--progress-interval` (default 5 s)
 instead of any control sequences, so piped and CI output stays clean.
 
+### 15.11 Heartbeat
+
+`internal/obs.Heartbeat`, started by both `sender.Run` and `receiver.Run`. Independent of the
+`Progress` renderer in §15.10 (neither side currently wires that renderer up): every 60 s it emits
+one `INFO` line naming which groups are still in flight, the live data-channel count, and the
+transfer rate averaged over the trailing 10 s sample window, in decimal (SI) units:
+
+```
+INFO  groups in progress  groups=3,7,12 channels=6 rate=42.3 MB/s
+```
+
+`groups` is the ascending set of group ids with at least one needed file not yet resolved
+(sender: `tracker.inProgressGroups`, derived from the existing `needed`/`resolved` maps; receiver:
+`needQueue.inProgressGroups`, backed by a per-group pending counter); `groups=none` once none are
+outstanding. `channels` is the live data-channel count (sender: channels with a running servicer;
+receiver: `session.channelCount()`). `rate` is `Δbytes/Δt` over the last 10 s sample, formatted by
+`humanRate` (decimal B/s, KB/s, MB/s, ... — unlike `humanBytes`, which uses binary units for
+on-disk sizes). The rate is resampled every 10 s but only logged every 60 s, so the reported number
+always reflects the trailing 10 s window rather than a session-wide average.
+
 ---
 
 ## 16. Configuration Surface
