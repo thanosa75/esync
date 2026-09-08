@@ -458,6 +458,10 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		case <-sigc:
 			obs.Warn(ctx, "signal received, stopping transfer")
 			s.fail(fault.ErrSignal)
+			// control.reader is parked in ctrl.RecvMsg(), which does not watch
+			// rootCtx; closing the conn unblocks it now so the decide/fetch
+			// pipeline drains immediately instead of waiting out workerStopGrace.
+			_ = ctrl.Close()
 		case <-rootCtx.Done():
 		}
 		return nil

@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"esync/internal/digest"
@@ -204,6 +206,43 @@ func installFatalHandler(ctx obs.Ctx, flush func()) {
 	})
 }
 
+// signalEscape enforces ARCHITECTURE §14.7. sender/receiver.Run install their
+// own handler that turns the first SIGINT/SIGTERM into a graceful root-context
+// cancel (checkpoint the journal, emit the summary, exit 5). This is the backstop
+// for when that graceful stop does not complete promptly: a second signal, or
+// grace elapsing after the first, forces the process down with code 5. Without it
+// a trapped second signal — and SIGTERM, also trapped — is silently swallowed and
+// only SIGKILL ends the process.
+func signalEscape(ctx obs.Ctx, sigc <-chan os.Signal, grace time.Duration, exit func(int)) {
+	obs.Go(ctx, "signal.escape", func() error {
+		if _, ok := <-sigc; !ok {
+			return nil
+		}
+		var graceCh <-chan time.Time
+		if grace > 0 {
+			graceCh = time.After(grace)
+		}
+		select {
+		case <-sigc:
+			obs.Warn(ctx, "second signal received, exiting now")
+		case <-graceCh:
+			obs.Warn(ctx, "shutdown grace elapsed, exiting now")
+		}
+		exit(5) // §14.6: interrupted by a signal
+		return nil
+	})
+}
+
+// installSignalEscape wires signalEscape to real OS signals and a real exit.
+func installSignalEscape(ctx obs.Ctx, grace time.Duration, flush func()) {
+	sigc := make(chan os.Signal, 2)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	signalEscape(ctx, sigc, grace, func(code int) {
+		flush()
+		os.Exit(code)
+	})
+}
+
 // once wraps flush so the deferred call and the fatal handler cannot double-close.
 func once(f func()) func() {
 	var o sync.Once
@@ -282,6 +321,7 @@ func runSender(args []string) int {
 	flush := once(flushRaw)
 	defer flush()
 	installFatalHandler(ctx, flush)
+	installSignalEscape(ctx, *c.shutdownGrace, flush)
 
 	cfg := sender.Config{
 		SourcePath:       rest[0],
@@ -383,6 +423,7 @@ func runReceiver(args []string) int {
 	flush := once(flushRaw)
 	defer flush()
 	installFatalHandler(ctx, flush)
+	installSignalEscape(ctx, *c.shutdownGrace, flush)
 
 	cfg := receiver.Config{
 		Link:               *link,

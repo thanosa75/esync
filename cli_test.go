@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"esync/internal/digest"
 	"esync/internal/fault"
@@ -168,5 +169,61 @@ func TestOnce(t *testing.T) {
 	f()
 	if n != 1 {
 		t.Errorf("once ran %d times, want 1", n)
+	}
+}
+
+func testCtx(t *testing.T) obs.Ctx {
+	t.Helper()
+	ctx, flush := obs.Init(obs.Config{Level: obs.LevelError, Sync: true, Role: "sender"})
+	t.Cleanup(flush)
+	return ctx
+}
+
+// TestSignalEscapeSecondSignal: the first signal is left to Run's own handler; a
+// second forces exit 5 (ARCHITECTURE §14.7).
+func TestSignalEscapeSecondSignal(t *testing.T) {
+	sigc := make(chan os.Signal, 2)
+	got := make(chan int, 1)
+	signalEscape(testCtx(t), sigc, time.Hour, func(code int) { got <- code })
+
+	sigc <- os.Interrupt
+	sigc <- os.Interrupt
+	select {
+	case code := <-got:
+		if code != 5 {
+			t.Fatalf("exit code = %d, want 5", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second signal did not force exit")
+	}
+}
+
+// TestSignalEscapeGraceTimeout: with only one signal, grace elapsing forces exit.
+func TestSignalEscapeGraceTimeout(t *testing.T) {
+	sigc := make(chan os.Signal, 2)
+	got := make(chan int, 1)
+	signalEscape(testCtx(t), sigc, 20*time.Millisecond, func(code int) { got <- code })
+
+	sigc <- os.Interrupt
+	select {
+	case code := <-got:
+		if code != 5 {
+			t.Fatalf("exit code = %d, want 5", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("grace timeout did not force exit")
+	}
+}
+
+// TestSignalEscapeNoSignal: absent any signal, the escape hatch never exits.
+func TestSignalEscapeNoSignal(t *testing.T) {
+	sigc := make(chan os.Signal, 2)
+	got := make(chan int, 1)
+	signalEscape(testCtx(t), sigc, 10*time.Millisecond, func(code int) { got <- code })
+
+	select {
+	case <-got:
+		t.Fatal("exit called with no signal delivered")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

@@ -70,6 +70,7 @@ common flags (ARCHITECTURE §16.1):
   --log-sync              format and write log records synchronously
   --redact-paths          replace paths with digests in logs
   --progress-interval <d> default 5s
+  --shutdown-grace <d>    force-exit delay after the first signal (default 5s)
   --hash md5|sha256       content digest (default md5; blake3 reserved)
   --quick                 trust size+mtime, skip same-size re-hash
   --no-cache              ignore the on-disk digest cache

@@ -98,9 +98,49 @@ operator's repeated "the progress bar still does not show". The heartbeat (a
 log-sink mechanism) is not a substitute: it does not write the stderr progress
 sink REQ-CLI-006/007 require.
 
+MFR-0008 · main/signal · `sender.Run`/`receiver.Run` each `signal.Notify` for
+SIGINT+SIGTERM and handle the first gracefully — which also disables the Go
+runtime's default die-on-SIGTERM. Every later signal, and plain `kill`, is then
+swallowed by the buffered channel, so only SIGKILL ends a wedged process. Keep
+`cli.go`'s `installSignalEscape` (both run paths, fed by `--shutdown-grace`,
+default 5s): after the first signal it exits 5 on a second signal or once grace
+elapses (§14.7 / §14.4). Also: `receiver.Run`'s `signal.watch` MUST `ctrl.Close()`
+after `s.fail` — `control.reader` is parked in `ctrl.RecvMsg()` with no rootCtx
+awareness and otherwise stalls the graceful drain for the full `workerStopGrace`.
+
 ---
 
 ## Session Log
+
+### 2026-09-08 — Ctrl-C not handled: signal force-exit backstop (MFR-0008)
+
+- Operator: "ctrl-c does not get handled; I have to kill the processes and get
+  <defunct> in linux."
+- Root cause: both `Run`s `signal.Notify` SIGINT+SIGTERM and gracefully cancel on
+  the first, which traps every later signal too (and SIGTERM, so plain `kill` is
+  inert) — the buffered sig channel drops them. `--shutdown-grace` had existed as
+  a flag since the 2026-09-04 CLI wiring but was never consumed. A slow/silent
+  graceful stop then looks dead and only `kill -9` works.
+- Fix (`cli.go`): `signalEscape(ctx, sigc, grace, exit)` parks until the first
+  signal (Run owns that one), then exits 5 on a second signal or `grace`
+  elapsing. `installSignalEscape` wires it to real signals + `flush()`+`os.Exit`,
+  called in both `runSender`/`runReceiver` after `installFatalHandler`, fed by
+  `*c.shutdownGrace`. `--shutdown-grace` added to `printUsage`.
+- Also (`receiver/run.go`): `signal.watch` now `ctrl.Close()`s after
+  `s.fail(ErrSignal)` — `control.reader` blocks in `ctrl.RecvMsg()` (no rootCtx
+  awareness), so the decide/fetch pipeline previously waited out the full 5s
+  `workerStopGrace` on every Ctrl-C. Sender's first-signal path was already
+  prompt (`tracker.wait` selects on `ctx.Done`).
+- Tests: `cli_test.go` — `TestSignalEscape{SecondSignal,GraceTimeout,NoSignal}`.
+  `installSignalEscape` stays 0% like its sibling `installFatalHandler` (real
+  `os.Exit`); root `esync` pkg at 73.2% is pre-existing (cli wiring is covered by
+  the e2e test, not unit tests). `make cover-check` 84.7% (min 80%); gofmt/vet/
+  build clean, `go test -race ./...` all green.
+- Follow-up cleared: "`--shutdown-grace` parsed but not consumed" (2026-09-04).
+  Still open: `--spill-threshold` parsed-only, `--owner` not wired into fetch,
+  and T-SIG-01/F-SIG-01 (the traceability matrix expects a signal E2E test; the
+  full first-signal → summary → exit-5 path is still only exercised end-to-end
+  by hand, not in CI).
 
 ### 2026-09-07 — grouping + reliability bundle (progress bar, stall detection, size-based groups)
 
@@ -341,56 +381,14 @@ sink REQ-CLI-006/007 require.
   advancing it) — worth a user sanity-check if real-world tuning behaviour
   ever looks wrong.
 
-### 2026-09-04 — CLI wiring, E2E test, coverage gate
-
-- Closed out the vertical slice: the phased workflow had already landed all of
-  `internal/*` (6 agents, 0 errors, full build/vet/test-race green); this session
-  wrote the thin orchestrator on top per ARCHITECTURE §17.
-- `main.go`: `run(args) int` does mode dispatch only — `--help`/`--version` short
-  circuit; `hasLinkFlag` (scans for `--link`/`-link`/`--link=` before a `--`
-  terminator) selects `runReceiver` vs `runSender`; no args → usage (exit 3). All
-  state machines/signal handling/summary rendering already live in
-  `sender.Run`/`receiver.Run` — main.go/cli.go never touch them beyond the call.
-- `cli.go`: full §16.1 flag surface (`registerCommon`) + sender/receiver-specific
-  flags, `ESYNC_<NAME>` env fallback applied only to flags `fs.Visit` didn't see
-  (flag > env > default), numeric floors via `atLeast` → E1007, `--hash` rejects
-  `blake3` (reserved, not implemented — E1007), `installFatalHandler` wires
-  `obs.OnFatal` → log + flush(once) + `os.Exit(fault.ExitCode(err))`.
-- E2E test (`e2e_test.go`, root `package main`): drives real `sender.Run` +
-  `receiver.Run` over real loopback TCP with a real X25519 handshake, 5 files
-  spanning empty/small/chunk-crossing/multi-MB, asserts byte-for-byte tree
-  equality + no `.esync/` residue. Skips gracefully if `paircode.Discover` finds
-  no usable LAN interface.
-- **Gotcha (not an MFR — no product bug, only a test-harness trap):** the E2E
-  test originally passed one shared `obs.Ctx` to both `sender.Run` and
-  `receiver.Run`; their `Summary` calls read the same live `obs.Counters`, so
-  each side's tallies summed with the other's ("transferred 10 files" for 5
-  actual files). Fixed by giving sender and receiver **separate** `obs.Init`
-  instances (`sctx`/`rctx`). Any future test driving both roles in one process
-  must do the same.
-- Coverage gate: `go test ./...` (per-package coverage) put `main` at 0% and
-  `sender`/`channel`/`digest`/`handshake` under 80% because the transfer engine
-  is mainly exercised through the root E2E test, not per-package unit tests.
-  Fixed two ways: (1) `Makefile` `cover`/`cover-check` now pass
-  `-coverpkg=$(COVERPKG)` (`COVERPKG ?= ./...`) so the E2E test's coverage
-  attributes to every package it exercises, not just `package main`; (2) added
-  `cli_test.go` (flag parsing, env precedence, usage-error paths, `hasLinkFlag`,
-  `atLeast`, `once`) since `-coverpkg` alone doesn't cover cli.go's parse-error
-  branches the E2E test never takes. Result: 84.3% total (min 80%).
-- Full gate run green: `gofmt -l .` clean, `go vet ./...` clean,
-  `go test -race ./...` all packages pass, `make check-goroutines` clean,
-  `go mod tidy -diff` clean, `make cover-check` 84.3%, `make build` produces
-  `bin/esync`. `golangci-lint` not installed in this environment (soft-fail
-  per Makefile, not a gate failure).
-- Follow-ups carried forward unchanged from the receiver session (adaptive
-  tuner, BLAKE3, `.part` checkpoint resume, SESSION_RESUME, etc. — see prior
-  entry) plus: `--owner` is parsed but not wired into fetch's materialisation
-  path; `--shutdown-grace` / `--spill-threshold` are parsed and validated but
-  not yet consumed by sender/receiver.
-
 ### 2026-09-04 — earlier sessions (pruned)
 
 - Entries for the initial vertical-slice implementation, the `internal/receiver`
   package build, and the CLI-wiring/E2E/coverage-gate session were pruned to keep
   this file under 400 lines. Their MFRs (MFR-0001) and follow-ups are retained
   above / below. See git history for detail.
+- Retained from the CLI-wiring session: `cover-check` passes `-coverpkg=./...` so
+  the root e2e test's coverage spreads to every package it exercises (hence low
+  isolated per-package numbers for `sender`/`channel`/root but a passing total).
+  Test-harness trap: a test driving both `Run`s in one process MUST give each its
+  own `obs.Init` — a shared `obs.Ctx` double-counts via the live `obs.Counters`.
