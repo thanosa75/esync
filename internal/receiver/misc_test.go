@@ -65,8 +65,13 @@ func TestTransportData(t *testing.T) {
 	if transportData(coded) != coded {
 		t.Fatal("coded fault should pass through unchanged")
 	}
-	if fault.GetCode(transportData(io.EOF)) != fault.E3005 {
-		t.Fatal("EOF should map to E3005")
+	// EOF and raw socket errors are recoverable channel loss (ARCHITECTURE §7.3
+	// row 1), not fatal E3005 — the fetch loop requeues and the worker rejoins.
+	if _, ok := transportData(io.EOF).(channelLost); !ok {
+		t.Fatal("EOF should classify as recoverable channel loss")
+	}
+	if _, ok := transportData(errors.New("connection reset by peer")).(channelLost); !ok {
+		t.Fatal("raw net error should classify as recoverable channel loss")
 	}
 }
 

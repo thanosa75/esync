@@ -42,43 +42,54 @@ type fetcher struct {
 	fail       func(error)
 }
 
-func (f *fetcher) loop(ctx context.Context) {
+func (f *fetcher) loop(ctx context.Context) (lostChannel bool) {
 	for {
 		it, ok := f.q.pop(ctx)
 		if !ok {
-			return
+			return false
 		}
 		err := f.fetchOne(ctx, it)
-		if err == nil {
+		switch {
+		case err == nil:
 			f.q.done(it.groupID)
-			continue
-		}
-		if ctx.Err() != nil {
+		case ctx.Err() != nil:
 			f.q.done(it.groupID)
-			return
-		}
-		if fault.IsFatal(err) {
-			f.fail(err)
-			f.q.done(it.groupID)
-			return
-		}
-		if fault.IsRetryable(err) && it.attempt+1 <= f.cfg.MaxRetries {
-			f.counters.Retries.Add(1)
-			obs.Warn(f.octx, "file transfer failed, retrying",
-				obs.F("file", it.fileID), obs.F("attempt", it.attempt+1), obs.F("err", err.Error()))
-			select {
-			case <-time.After(fault.Backoff(it.attempt, f.rnd)):
-			case <-ctx.Done():
-				f.q.done(it.groupID)
-				return
+			return false
+		default:
+			var lost channelLost
+			if errors.As(err, &lost) {
+				// §7.3 row 1: the in-flight file returns to the need queue (it is
+				// not resolved, failed, or counted) and this channel worker ends;
+				// registerAndStart attempts a fresh CHANNEL_JOIN to replace it.
+				f.q.requeue(it)
+				f.counters.Retries.Add(1)
+				obs.Warn(f.octx, "data channel lost, in-flight file requeued",
+					obs.F("file", it.fileID), obs.F("chan", int(f.conn.ID())), obs.F("err", lost.Error()))
+				return true
 			}
-			it.attempt++
-			f.q.requeue(it) // re-enters the queue; may be served by another channel
-			continue
+			if fault.IsFatal(err) {
+				f.fail(err)
+				f.q.done(it.groupID)
+				return false
+			}
+			if fault.IsRetryable(err) && it.attempt+1 <= f.cfg.MaxRetries {
+				f.counters.Retries.Add(1)
+				obs.Warn(f.octx, "file transfer failed, retrying",
+					obs.F("file", it.fileID), obs.F("attempt", it.attempt+1), obs.F("err", err.Error()))
+				select {
+				case <-time.After(fault.Backoff(it.attempt, f.rnd)):
+				case <-ctx.Done():
+					f.q.done(it.groupID)
+					return false
+				}
+				it.attempt++
+				f.q.requeue(it) // re-enters the queue; may be served by another channel
+				continue
+			}
+			obs.LogFault(f.octx, err)
+			f.counters.FilesFailed.Add(1)
+			f.q.done(it.groupID)
 		}
-		obs.LogFault(f.octx, err)
-		f.counters.FilesFailed.Add(1)
-		f.q.done(it.groupID)
 	}
 }
 
@@ -241,15 +252,24 @@ func pad4(n uint16) string {
 	return s
 }
 
+// channelLost marks a data-channel transport failure that a fresh CHANNEL_JOIN
+// can recover from (ARCHITECTURE §7.3 row 1: "Data channel closes / errors"):
+// the peer closed the connection or the socket died. Errors that carry an
+// E-code are deliberately NOT channel loss — a stall (E3005, half-open sender),
+// a record/auth fault (E4xxx/E5xxx), a protocol fault (E5001/E5006), or a file
+// error — and keep their existing fatal/item semantics.
+type channelLost struct{ cause error }
+
+func (e channelLost) Error() string { return "data channel lost: " + e.cause.Error() }
+func (e channelLost) Unwrap() error { return e.cause }
+
+// transportData classifies a data-channel transport error. EOF, a closed socket
+// and raw net errors (no E-code) mean the connection died: recoverable channel
+// loss. Anything already carrying an E-code (stall E3005 from RecvMsgTimeout,
+// record/auth violations, …) passes through unchanged.
 func transportData(err error) error {
-	if err == nil {
-		return nil
-	}
-	if fault.GetCode(err) != "" {
+	if err == nil || fault.GetCode(err) != "" {
 		return err
 	}
-	if errors.Is(err, io.EOF) {
-		return fault.New(fault.E3005, "data channel closed", "", err)
-	}
-	return fault.Wrap(fault.E3005, "data channel transport", "", err)
+	return channelLost{err}
 }

@@ -201,3 +201,11 @@ func (q *needQueue) depth() int {
 	defer q.mu.Unlock()
 	return len(q.items)
 }
+
+// drained reports the same "nothing left" state pop signals via ok=false
+// (closed, nothing queued, nothing in flight).
+func (q *needQueue) drained() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed && len(q.items) == 0 && q.inflight == 0
+}

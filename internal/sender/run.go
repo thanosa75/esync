@@ -300,11 +300,23 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		activeChannels.Add(1)
 		obs.Go(octx, "servicer", func() error {
 			defer activeChannels.Add(-1)
+			defer dc.Close() // free the socket as soon as this worker ends
 			if err := s.run(rootCtx); err != nil {
 				if rootCtx.Err() == nil {
-					setFatal(fault.Wrap(fault.E3005, "data channel", "", err))
+					if fault.GetCode(err) == "" {
+						// A raw transport error means the data channel itself died
+						// (ARCHITECTURE §7.3 row 1): the receiver requeues its
+						// in-flight file and rejoins with a fresh CHANNEL_JOIN,
+						// which join.accept below keeps answering. This is not a
+						// session failure. Coded faults (record/auth violations)
+						// stay fatal.
+						obs.Debug(ctx, "data channel lost, awaiting a receiver rejoin",
+							obs.F("chan", int(dc.ID())), obs.F("err", err.Error()))
+					} else {
+						setFatal(fault.Wrap(fault.E3005, "data channel", "", err))
+						cancel()
+					}
 				}
-				cancel()
 			}
 			return nil
 		})
@@ -313,33 +325,28 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 		startServicer(dc)
 	}
 
-	// Keep accepting CHANNEL_JOINs beyond the initial batch: the receiver's
-	// adaptive tuner (§13.4) can grow N up to cfg.MaxChannels (the ceiling this
-	// sender advertised in SESSION_PARAMS, §7.1) as the transfer runs. Each late
-	// joiner gets its own servicer, exactly like the initial batch. lst.Accept
-	// unblocks with an error once the step-4 defer closes lst on return, ending
-	// this goroutine along with every other rootCtx-scoped one.
-	if len(dataConns) < cfg.MaxChannels {
-		obs.Go(octx, "join.accept", func() error {
-			joined := len(dataConns)
-			for joined < cfg.MaxChannels {
-				nc, err := lst.Accept()
-				if err != nil {
-					return nil // lst closed: session ending
-				}
-				id, jerr := handshake.AcceptChannel(octx, nc, sess, uint8(cfg.MaxChannels))
-				if jerr != nil {
-					_ = nc.Close()
-					obs.Warn(ctx, "late channel join rejected", obs.F("cause", jerr))
-					continue
-				}
-				dc := channel.Data(nc, id, sess, channel.Sender, cfg.SocketBuffer)
-				joined++
-				startServicer(dc)
+	// Keep accepting CHANNEL_JOINs beyond the initial batch — and beyond the
+	// count the receiver opened at SESSION_READY: the adaptive tuner (§13.4)
+	// grows N up to cfg.MaxChannels, and a lost data channel is rejoined by a
+	// fresh connection (§7.3). Each join gets its own servicer, exactly like the
+	// initial batch; the per-join ceiling is enforced inside AcceptChannel
+	// (channel id must stay ≤ cfg.MaxChannels), so this loop simply runs until
+	// lst closes on Run's return.
+	obs.Go(octx, "join.accept", func() error {
+		for {
+			nc, err := lst.Accept()
+			if err != nil {
+				return nil // lst closed: session ending
 			}
-			return nil
-		})
-	}
+			id, jerr := handshake.AcceptChannel(octx, nc, sess, uint8(cfg.MaxChannels))
+			if jerr != nil {
+				_ = nc.Close()
+				obs.Warn(ctx, "channel join rejected", obs.F("cause", jerr))
+				continue
+			}
+			startServicer(channel.Data(nc, id, sess, channel.Sender, cfg.SocketBuffer))
+		}
+	})
 
 	mp := &manifestPublisher{
 		ctx:     octx,

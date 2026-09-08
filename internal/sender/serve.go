@@ -60,7 +60,17 @@ func (s *servicer) run(ctx context.Context) error {
 	}
 }
 
-func (s *servicer) serve(ctx context.Context, req *wire.FileRequest) error {
+func (s *servicer) serve(ctx context.Context, req *wire.FileRequest) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			// The request died with the channel (transport failure while
+			// streaming) or on a serve-time fault. Drop it WITHOUT resolving the
+			// file: the receiver requeues it and re-requests it on a rejoin
+			// channel (§7.3), and the tracker must keep waiting for that later
+			// completion — and must not leak this request's in-flight slot.
+			s.tr.reqFailed(req.RequestID, false, false)
+		}
+	}()
 	end := obs.Start(s.ctx, "file.transfer")
 
 	if req.FileID >= uint64(len(s.entries)) {

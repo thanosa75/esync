@@ -147,10 +147,14 @@ func (s *session) dialOneData(octx obs.Ctx, id uint8) (*channel.Conn, error) {
 	if err != nil {
 		return nil, fault.Wrap(fault.E3006, "dial data channel", s.addr, err)
 	}
+	// A join must never block forever (REQ-NET-010): bound the CHANNEL_JOIN
+	// round-trip like the sender bounds its accept window.
+	_ = raw.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
 	if err := handshake.JoinChannel(octx, raw, s.hsess, id); err != nil {
 		raw.Close()
 		return nil, err
 	}
+	_ = raw.SetDeadline(time.Time{})
 	return channel.Data(raw, id, s.hsess, channel.Receiver, s.cfg.SocketBuffer), nil
 }
 
@@ -180,7 +184,9 @@ func (s *session) newFetcher(octx obs.Ctx, conn *channel.Conn) *fetcher {
 // registerAndStart adds an already-dialed connection to the live worker list
 // and starts its fetch loop. The caller must already have accounted for it in
 // s.chWg (a chWg.Add(1) done under s.chMu, so it can never race the pipeline's
-// final chWg.Wait — see addChannel and the initial dial in Run).
+// final chWg.Wait — see addChannel and the initial dial in Run). When the fetch
+// loop ends because the channel itself was lost (§7.3), a rejoin goroutine is
+// started to replace it.
 func (s *session) registerAndStart(octx obs.Ctx, id uint8, conn *channel.Conn) {
 	chCtx, cancel := context.WithCancel(s.rootCtx)
 	w := &chanWorker{id: id, conn: conn, cancel: cancel}
@@ -191,11 +197,19 @@ func (s *session) registerAndStart(octx obs.Ctx, id uint8, conn *channel.Conn) {
 	f := s.newFetcher(obs.With(octx, obs.F("chan", int(id))), conn)
 	obs.Go(octx, "fetch", func() error {
 		defer func() {
-			conn.Close() // idempotent; frees the sender-side slot immediately on retire
+			conn.Close() // idempotent; frees the sender-side socket immediately on retire
 			s.removeWorker(id)
 			s.chWg.Done()
 		}()
-		f.loop(chCtx)
+		if lost := f.loop(chCtx); lost && s.rootCtx.Err() == nil {
+			// ARCHITECTURE §7.3 row 1: the in-flight file was requeued; attempt a
+			// fresh CHANNEL_JOIN to keep this worker's slot. The requeued file is
+			// fetched by whichever channel is up first.
+			obs.Go(octx, "channel.rejoin", func() error {
+				s.rejoinLoop(octx)
+				return nil
+			})
+		}
 		return nil
 	})
 }
@@ -222,6 +236,64 @@ func (s *session) addChannel(octx obs.Ctx) error {
 	}
 	s.registerAndStart(octx, id, conn)
 	return nil
+}
+
+// joinBackoff is the CHANNEL_JOIN retry schedule after a data channel is lost
+// (ARCHITECTURE §7.3: 0.5 s, 2 s, 8 s). Exposed as a var so tests can shorten it.
+var joinBackoff = [...]time.Duration{500 * time.Millisecond, 2 * time.Second, 8 * time.Second}
+
+// dataCeiling is the maximum live data channels this session will ever open —
+// the same bound the tuner (or --channels pinning) respects, clamped to the
+// ceiling the sender advertised in SESSION_PARAMS.
+func (s *session) dataCeiling() int {
+	maxCh := s.cfg.MaxChannels
+	if s.cfg.ChannelsPinned {
+		maxCh = s.cfg.Channels
+	}
+	if s.senderMaxChannels > 0 && s.senderMaxChannels < maxCh {
+		maxCh = s.senderMaxChannels
+	}
+	if maxCh < 1 {
+		maxCh = 1
+	}
+	return maxCh
+}
+
+// rejoinLoop tries to replace one lost data channel (ARCHITECTURE §7.3). Each
+// attempt dials and CHANNEL_JOINs a fresh channel — a fresh id means fresh
+// per-channel keys and sequence numbers, so a rejoin never reuses crypto state
+// across physical connections. On success the session simply has a worker back;
+// on exhaustion the channel is retired: N drops by one, and if that leaves zero
+// live channels while the need queue still has work, the last-retired condition
+// is fatal E3005.
+func (s *session) rejoinLoop(octx obs.Ctx) {
+	for i := 0; i < len(joinBackoff); i++ {
+		select {
+		case <-time.After(joinBackoff[i]):
+		case <-s.rootCtx.Done():
+			return
+		}
+		if s.err() != nil {
+			return
+		}
+		// Another rejoin (or the tuner) may already have restored the slot.
+		if s.channelCount() >= s.dataCeiling() {
+			return
+		}
+		if err := s.addChannel(octx); err == nil {
+			return
+		} else if err == errPipelineDone {
+			return
+		} else {
+			obs.Warn(octx, "data channel rejoin attempt failed",
+				obs.F("attempt", i+1), obs.F("err", err.Error()))
+		}
+	}
+	obs.Warn(octx, "data channel rejoin exhausted, channel retired")
+	// §7.3: "Last data channel retired | N reaches 0 | Fatal E3005."
+	if s.err() == nil && s.channelCount() == 0 && !s.q.drained() {
+		s.fail(fault.New(fault.E3005, "last data channel retired", "", nil))
+	}
 }
 
 // retireOne cancels the most recently opened channel's fetch loop, so it exits
