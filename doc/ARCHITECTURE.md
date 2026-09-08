@@ -1353,7 +1353,7 @@ Fault {
 | **E3002** | Fatal | – | Connect timeout on all candidates | As `E3001` |
 | **E3003** | Item→Fatal | yes | Connection reset mid-session | Automatic: requeue and rejoin; fatal if the control channel and resume fails |
 | **E3004** | Fatal | – | Peer unresponsive past the keepalive deadline | Check the other machine; resume with the same command |
-| **E3005** | Fatal | – | A data channel is lost, idle past `--stall-timeout`, or the last one retired | Re-run; the receiver resumes from its journal |
+| **E3005** | Fatal | – | Unrecoverable data-channel failure: idle past `--stall-timeout`, last channel retired with work outstanding, or a coded channel fault | Re-run; the receiver resumes from its journal |
 | **E3006** | Item | yes | `CHANNEL_JOIN` rejected | Automatic retry; channel retired on exhaustion |
 | **E3007** | Fatal | – | Control channel resume window expired | Re-run; the receiver resumes from its journal |
 | **E4001** | Fatal | – | Handshake confirmation MAC failed | The code is wrong or a MITM is present (exit `4`) |

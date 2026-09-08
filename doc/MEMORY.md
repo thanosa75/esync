@@ -108,9 +108,77 @@ elapses (§14.7 / §14.4). Also: `receiver.Run`'s `signal.watch` MUST `ctrl.Clos
 after `s.fail` — `control.reader` is parked in `ctrl.RecvMsg()` with no rootCtx
 awareness and otherwise stalls the graceful drain for the full `workerStopGrace`.
 
+MFR-0009 · plan/Build · Excluded directories must PRUNE their whole subtree, not
+just drop the directory entry. sys-set and user-filter matches on a directory
+mean its contents are never seen: no file ids, no digest contribution, no
+per-child exclusion record or count, and a later (even `+`) rule can never
+re-admit a path beneath them. Implement as two passes over the entry set —
+classify every entry (sys set first), collect the pruned directory prefixes,
+then drop anything beneath one — so the outcome stays a pure function of the
+entry set (P-SCAN-01 order independence holds when a child precedes its parent
+in the input). A per-entry-only exclusion (the pre-fix behaviour) silently
+transfers the contents of `.Trash-1000`, `__MACOSX`, `lost+found` and of every
+`--exclude`d directory, pollutes the manifest digest and the resume-journal
+identity (R-03).
+
+MFR-0010 · receiver-fetch/sender-servicer · NEVER map a raw data-channel transport
+error to a session-fatal E3005. A data channel that closes or errors mid-file is
+recoverable per ARCHITECTURE §7.3 row 1: requeue the in-flight file (do not
+fail/count it), end the channel worker, and rejoin with a fresh CHANNEL_JOIN
+(fresh channel id = fresh per-channel keys + seq; never reuse crypto state
+across physical connections). The sender must tolerate a servicer that dies
+with its connection — log, close the socket, and keep `join.accept` answering
+rejoins — and must drop the dead request WITHOUT resolving the file
+(`tracker.reqFailed(reqID, resolve=false)`), or its in-flight accounting leaks.
+Only a stall (per-receive deadline, half-open sender), a coded channel/record
+fault, or the LAST channel retiring with work still queued is E3005 (R-24).
+
 ---
 
 ## Session Log
+
+### 2026-09-08 — audit-driven hardening: excluded-dir pruning (R-03) + data-channel-loss recovery (R-24)
+
+- Re-audit (3 agents, HEAD `ae19178`) confirmed the STATUS_SUMMARY findings; this
+  session resolved two of the three HIGH gaps the operator prioritised.
+- **R-03 / gap 3 — excluded directories now prune their whole subtree (MFR-0009).**
+  `plan.Build` classified per entry and recorded `Exclusion.Prune` but never
+  dropped the contents of an excluded directory — children of `.Trash-1000`,
+  `__MACOSX`, `lost+found` and of any `--exclude` dir survived into the plan,
+  took file ids, polluted the manifest digest + resume identity, and were
+  transferred. Fixed with a two-pass Build (classify all entries → collect pruned
+  prefixes → drop anything beneath one); subtree drops are silent (no per-child
+  record/count), dominating any rule, order-independent (P-SCAN-01 preserved;
+  `TestPruneOrderIndependent` shuffles a child before its pruned parent). Tests:
+  `internal/plan/prune_test.go` (sys-dir contents incl. deeper prefix rules,
+  filter-excluded dir subtrees, digest equality with a never-walked tree).
+  Commit 75fbff4.
+- **R-24 / gap 2 — a lost data channel is recoverable, not fatal (MFR-0010).**
+  Receiver: raw transport errors (EOF/socket death, no E-code) classify as
+  recoverable channel loss — the in-flight file is requeued (never failed/
+  counted) and the worker ends; a `channel.rejoin` goroutine re-dials with a
+  fresh CHANNEL_JOIN (0.5/2/8 s), fresh id = fresh keys+seq; exhaustion retires
+  the channel, and the last one retiring with work queued is E3005. Stall
+  (RecvMsgTimeout) and coded record/auth faults stay fatal. `dialOneData` bounds
+  the join round-trip. Sender: a servicer transport error logs + exits (conn
+  closed) instead of killing the session; `join.accept` now runs for the whole
+  session; a request that dies with its channel is dropped unresolved
+  (`reqFailed(resolve=false)`) so the tracker never leaks an in-flight slot.
+  E3005 catalogue/§14.2 wording synced (stall / last-retired / coded fault).
+  Tests: `internal/receiver/rejoin_test.go` (real TCP + handshake + record
+  layer): mid-file kill recovers with both files published and exit 0; idle
+  loss recovers; rejoin exhaustion → E3005. Commit a6d5c6f.
+- **Gap 1 (SESSION_RESUME suspend/re-dial) — design delivered, code awaits
+  sign-off.** The doc is internally contradictory on this feature (E3004 vs
+  E3007 for expiry; "fresh handshake" vs single-use code/RISK-04; 0x70 body and
+  `LastSeqSeen` undefined). Implementing blind would guess at a security-
+  critical protocol; instead `doc/SESSION_RESUME_DESIGN.md` pins one concrete
+  contract (reuse ch-0 keys on the re-dialed conn, 0x70 as first frame,
+  E3007-on-expiry, sender replay ring keyed by `LastSeqSeen`) and asks the
+  operator to confirm D1–D4 before the implementation (change list items 1–7 in
+  that doc).
+- Gates: gofmt/vet/build clean, `go test -race ./...` all green, full-suite
+  `-coverpkg` still passes (plan 93.5%, receiver 84.2% in isolation).
 
 ### 2026-09-08 — Ctrl-C not handled: signal force-exit backstop (MFR-0008)
 
@@ -198,120 +266,30 @@ awareness and otherwise stalls the graceful drain for the full `workerStopGrace`
   sender `drain` span still bills the whole transfer (from the prior entry).
 
 ### 2026-09-07 — sender E9002 drain watchdog: deadline → inactivity
-
-- User brought logs from a 43GB/176k-file run that died with `E9002 drain
-  watchdog` on the sender ("an accounting defect; report with the log"), only
-  13GB transferred, "not all groups were transferred". Asked for the
-  highest-ROI fix.
-- Diagnosis: **false positive**, not an accounting leak. The `needed`/`resolved`
-  bookkeeping was correct; the *arming condition* was wrong. `tracker.wait`
-  started the 60s timer on `allDecidedCh` (`groups_decided == total_groups`),
-  but the receiver sends `GROUP_DECISION` at the head of `decideGroup`
-  (`decide.go:250`), before the `pushGroup` backpressure point (`:281`).
-  Under load decide ran ~20 min ahead of fetch — four decide workers blocked
-  inside `pushGroup` (spans `group=53` 1.16e6 ms, `84` 1.21e6, `56` 1.42e6,
-  `186` 2.8e5, all `outcome=ok`). Sender saw all 204 decisions at ~14:43:12,
-  armed 60s, expired 14:44:10 while the receiver was still fetching 4096
-  freshly-enqueued files. Receiver's `E3005 EOF` was downstream fallout of the
-  sender's teardown; the E7011 absolute-symlink rejections were unrelated.
-- This is the sender-side sibling of MFR-0003 (receiver side, fixed earlier
-  from the *same* logs). MFR-0003 cited `sender/state.go` as the correct
-  model — amended, since the sender cannot compute reachability at all.
-- Fix (MFR-0004): `tracker.progress atomic.Uint64`, bumped by the four request
-  lifecycle methods and once per streamed chunk in `serve`; `tracker.wait`
-  loops sampling it and fires E9002 only after a full `--drain-timeout` with
-  zero movement. No wire change, no receiver change, no protocol version bump
-  — chosen over adding an R→S "no more requests" message (correct but touches
-  the wire format) and over gating on CREDIT count (shrinks the window but
-  still breaks on a large tail). ARCHITECTURE §13.7 rewritten to state the two
-  sides' differing arming rules.
-- Tests: `TestTrackerDrainWatchdogIgnoresLiveTransfer` (work spanning 8 drain
-  windows must not trip — fails deterministically pre-fix with the user's exact
-  error) and `TestTrackerDrainWatchdogTripsOnStall` (in-flight request, then
-  silence, still trips — the watchdog is not defanged).
-- Noticed, not changed (Rule 3): the sender's `drain` span in `run.go:349`
-  starts before `tr.wait` blocks on `allDecidedCh`, so it bills the entire
-  transfer to "drain" (`dur_ms=1.6e6` in the report) — misleading name, worth
-  splitting into `transfer` + `drain` in a future pass.
+- Compressed: fully captured by MFR-0004 and the follow-up line in the
+  grouping+reliability entry. Original: a 43GB/176k-file run died E9002 at
+  ~14:44 with 13GB transferred; the watchdog was armed on `allDecidedCh` while
+  decide ran ~20 min ahead of fetch. Fixed by sampling `tracker.progress`.
 
 ### 2026-09-07 — 60s groups/channels/bandwidth heartbeat
 
-- User request: "every 60s you should emit which groups are in progress ...
-  add also channels and bandwidth averaged on the 10s interval, in human
-  readable". Clarified via question: heartbeat runs on **both** sender and
-  receiver; user noted the existing `Progress` renderer (§15.10) isn't wired
-  up on either side, so this is a new, independent mechanism rather than an
-  extension of it — see ARCHITECTURE §15.11.
-- New `internal/obs/heartbeat.go`: `Heartbeat`/`NewHeartbeat(ctx,
-  sampleInterval, logInterval, groups func() []uint32, channels func() int)`
-  samples `ctx.Counters().Bytes` every 10s (default) to compute a trailing-
-  window rate, logs at INFO every 60s (default): `groups=<ascending ids or
-  "none"> channels=<n> rate=<humanRate>`. `Stop()` is synchronous (closes a
-  `done` channel the loop goroutine closes on exit) so callers can safely
-  read shared state (e.g. a test's log buffer) right after — an earlier
-  fire-and-forget `Stop()` raced the loop's final possible log write under
-  `-race`.
-- New `humanRate` in `progress.go`: decimal (SI, base-1000) B/s→KB/s→MB/s...,
-  deliberately distinct from `humanBytes` (binary, base-1024, for on-disk
-  sizes) — matches how bandwidth is conventionally reported and the user's
-  literal "MB/sec, KB/sec" phrasing.
-- "In progress" derivation differs per side because sender and receiver
-  track group/file state differently: sender's `tracker.inProgressGroups()`
-  (`state.go`) reads the pre-existing `needed`/`resolved` maps (file ids ÷
-  1024 = group id), no new state. Receiver's `needQueue` had no per-group
-  bookkeeping at all, so `queue.go` gained a `pending map[uint32]int`
-  incremented in `pushGroup` and decremented in `done`, which changed
-  `done()`'s signature to `done(groupID uint32)` — updated all 5 call sites
-  in `fetch.go` and the pre-existing calls in `queue_test.go`.
-- Channel counts: receiver reused the existing `session.channelCount()`.
-  Sender had no equivalent, so `run.go` gained a package-level-scoped
-  `activeChannels atomic.Int64` incremented/decremented around each
-  servicer's lifecycle in `startServicer`.
-- Wired in: `sender/run.go` after the manifest goroutine starts (before the
-  termination wait); `receiver/run.go` inside the existing `if
-  !cfg.DryRun` block, alongside the per-channel `registerAndStart` calls.
-  Both use `defer hb.Stop()`.
-- Full gate green: `gofmt -l .` clean, `go vet ./...` clean, `go build
-  ./...`, `go test -race ./...` all packages, `make check-goroutines` clean
-  (heartbeat goroutine goes through `obs.Go` like everything else),
-  `make cover-check` 84.1% (min 80%; `internal/sender` alone shows 39.1% in
-  isolation but that's pre-existing — `Run()`/`walk.go` are mainly covered
-  by e2e tests, not unit tests, and this change didn't touch that balance).
-- Not done (not requested, and would violate surgical-changes): wiring up
-  the existing `Progress` renderer, or extending `--progress-interval` to
-  cover this — the heartbeat is a separate, always-on mechanism.
+- New `internal/obs/heartbeat.go`: samples `ctx.Counters().Bytes` every 10s,
+  logs at INFO every 60s: `groups=<ascending ids or "none"> channels=<n>
+  rate=<humanRate>`. `Stop()` is synchronous (a `done` channel the loop closes)
+  so callers can read shared state after it without a `-race` hazard. New
+  `humanRate` (decimal SI) distinct from `humanBytes` (binary). Receiver group
+  ids come from a new `pending map[uint32]int` in `needQueue` (`done(groupID)`
+  signature change, 5 call sites); sender from `tracker.inProgressGroups()` and
+  a new `activeChannels atomic.Int64` around each servicer. Wired into both
+  runs next to the (previously uninstantiated) progress renderer with
+  `defer hb.Stop()`.
 
 ### 2026-09-07 — Fix: receiver drain watchdog fires mid-transfer (E9002)
-
-- Diagnosed from a real sender/receiver log pair the user pasted: a
-  43GB/176k-file resume (34k files / 4GB actually needed) died with
-  `E9002 await SESSION_SUMMARY` at 2m12s despite `group.decide` spans still
-  completing right up to the failure — i.e. it was progressing, not stuck.
-  Root cause: `receiver/run.go`'s pipeline-drain `select` armed
-  `cfg.DrainTimeout + workerStopGrace` (65s) from the moment the fetch
-  pipeline was launched, not from when termination became *reachable*
-  (§13.7). A 4GB fetch phase at the observed ~40-60Mbps/channel goodput
-  routinely exceeds 60s, so the watchdog was firing on essentially every
-  transfer of this size, independent of real health. See MFR-0003.
-- Fix: split the single `select` into two phases mirroring
-  `sender/state.go`'s `tracker.wait` — wait unbounded (only cancellable by
-  `rootCtx`, graced by `workerStopGrace` once cancelled) for `reachable`
-  (`decideWg.Wait()`/`q.close()`/`q.waitDrained()`, i.e. `pipelineDone`);
-  only then arm `cfg.DrainTimeout` around `s.chWg.Wait()` (`done`), raising
-  the fatal `E9002` itself on that specific timeout (previously the single
-  select only logged a non-fatal WARN and fell through, and the real E9002
-  came from a second, equally mistimed `DrainTimeout` wait on
-  `SESSION_SUMMARY` in step 11). New `waitGrace` helper factors the
-  post-cancellation bounded-wait-with-warning used in both phases.
-- Full gate green: `gofmt -l .` clean, `go vet ./...` clean,
-  `go test -race ./...` all packages, `internal/receiver` coverage 81.9%
-  (min 80%).
-- No test added that reproduces the exact multi-GB-fetch-past-60s timing
-  (would need a paced fake sender run past `DrainTimeout`, similar to
-  `tune_test.go`'s `TestRunAdaptiveRampUp` pattern) — flagged as a follow-up
-  if this area gets touched again; the fix here is structural (same
-  before/after control flow the existing `-race` suite already exercises)
-  rather than behavior only a new timing test would catch.
+- Compressed: fully captured by MFR-0003. Original: the receiver armed
+  `DrainTimeout + workerStopGrace` from pipeline launch, killing any fetch
+  phase longer than 60s; fixed by arming only once termination is reachable
+  (`decideWg.Wait()`/`q.close()`/`q.waitDrained()`), with `waitGrace` bounding
+  the post-cancel unwind.
 
 ### 2026-09-04 — Adaptive channel tuner (REQ-PAR-004) + sender-side dynamic join
 

@@ -1,8 +1,18 @@
 # esync — Code vs Architecture Audit: Status Summary
 
-**Date:** 2026-09-07 (tree: branch `grouping-and-reliability`, 32 files modified/uncommitted, HEAD `2671cde`)
+**Date:** 2026-09-08 (HEAD `ae19178`; original audit 2026-09-07 at HEAD `2671cde` on branch `grouping-and-reliability` with 32 files uncommitted — that work is now commit `4bd970f`, merged to main via PR #1)
 **Scope:** every non-test package (root, `internal/{channel,crypto,digest,fault,fsx,obs,paircode,plan,receiver,sender,wire}` ≈ 20 kLOC) cross-checked against `doc/ARCHITECTURE.md` (§1–21, incl. the 156-row §18.1 matrix), `doc/INITIAL_REQS.md` (156 REQ-ids), and `doc/MEMORY.md` (MFRs + known follow-ups).
-**Method:** nine parallel subsystem audits (each read its full doc sections + full package source, cited file:line), plus independent re-verification here of the top ~12 load-bearing claims, plus ground-truth gate runs. Effort scale: S <½ d · M 1–2 d · L 3–5 d · XL >5 d. Findings marked **KNOWN** were already listed as MEMORY.md follow-ups; **NEW** were not. No re-reported MFR (fixed bug) appears.
+**Method:** nine parallel subsystem audits (each read its full doc sections + full package source, cited file:line), plus independent re-verification here of the top ~12 load-bearing claims, plus ground-truth gate runs. Effort scale: S <½ d · M 1–2 d · L 3–5 d · XL >5 d. Findings marked **KNOWN** were already listed as MEMORY.md follow-ups; **NEW** were not. No re-reported MFR (fixed bug) appears. **Re-audit 2026-09-08:** three parallel read-only agents (§4–8 security/transport, §9–13 pipeline, §14–21 meta) re-ran the same doc-vs-code check against HEAD `ae19178`; every finding below was re-confirmed with unchanged file:line evidence and no new critical issue surfaced.
+
+### Re-audit delta (2026-09-08, HEAD `ae19178`)
+
+- **RESOLVED — R-09** (commit `ae19178`): second-signal / `--shutdown-grace` force-exit backstop implemented. `cli.go` `signalEscape`/`installSignalEscape` exit 5 after a second SIGINT/SIGTERM or grace expiry, wired into both run paths (`cli.go:324`, `cli.go:426`); receiver closes the control conn on first signal to unblock the parked reader (`receiver/run.go`); `doc/MEMORY.md` MFR-0008; `cli_test.go` coverage added. `--shutdown-grace` is no longer dead.
+- **RESOLVED — R-05**: the `.claude/worktrees/…` stale-`.go` copy is gone; `make check-goroutines` and `make ci` are **green (exit 0, re-run today)**. R-01 (CI workflow still runs only `make dist`) remains open.
+- **Ground truth re-run today:** `gofmt`/`go vet`/`go build` clean; `go test -race -count=1 ./...` **13/13 packages pass**; total coverage **84.7 %** (was 85.0 % at the 09-07 audit — within run noise); check-goroutines clean; E-code catalogue still **71/71** vs §14.2 (one agent's "88" was a loose non-unique count); message catalogue 19/19.
+- **Two new doc-drift items added to Tier 4** (SCAN_PROGRESS never emitted; PING/PONG RTT never reaches the tuner). No Tier 1–3 finding changed status except R-09/R-05 above.
+- **RESOLVED — R-03** (commit `75fbff4`, 2026-09-08): excluded directories are now pruned, not merely dropped — `plan.Build` drops the whole subtree of a sys-set or `--exclude`d directory (silently, no per-child record/count, dominating any rule, order-independent). Tests in `internal/plan/prune_test.go`. See MEMORY.md MFR-0009.
+- **RESOLVED — R-24** (commit `a6d5c6f`, 2026-09-08): a lost data channel is recoverable per §7.3 row 1 — receiver requeues the in-flight file and rejoins with a fresh CHANNEL_JOIN (0.5/2/8 s; exhaustion retires the channel; last-retired-with-work → E3005); sender tolerates servicer loss and keeps answering rejoins. E3005 catalogue/§14.2 wording synced. Tests in `internal/receiver/rejoin_test.go` (F-NET-01-style, real TCP + handshake). See MEMORY.md MFR-0010.
+- **ITEM 1 (SESSION_RESUME / R-26) — design delivered, code pending sign-off**: `doc/SESSION_RESUME_DESIGN.md` resolves the doc's internal contradictions (E3004-vs-E3007, fresh-handshake-vs-single-use-code, 0x70/`LastSeqSeen` semantics) and pins a concrete contract + change list; implementation awaits confirmation of decisions D1–D4.
 
 ---
 
@@ -10,7 +20,7 @@
 
 The implementation is in good shape at the **core**: record layer, message catalogue, E-code catalogue, key schedule, golden vectors, and the recent reliability fixes (MFR-0001…0007) all verify byte-for-byte / line-for-line against the docs. The full `-race` suite is green and coverage passes.
 
-The problems are **not in the security/wire core** — they are (a) a small set of **silent-wrong-output behaviors** (pruning, hardlinks, peer notification, dry-run), (b) a **verification story that is substantially fabricated** (§18.1 matrix, fault-injection/E2E/bench suites, CI), and (c) **docs that describe absent features as working** (SESSION_RESUME, `.part` checkpoint, external sort, `--compact-code`, `--owner`, `--shutdown-grace`) — plus a stale header that still says *"No code exists yet. Protocol version 1."*
+The problems are **not in the security/wire core** — they are (a) a small set of **silent-wrong-output behaviors** (pruning, hardlinks, peer notification, dry-run), (b) a **verification story that is substantially fabricated** (§18.1 matrix, fault-injection/E2E/bench suites, CI), and (c) **docs that describe absent features as working** (SESSION_RESUME, `.part` checkpoint, external sort, `--compact-code`, `--owner`; `--shutdown-grace` since fixed — see delta) — plus a stale header that still says *"No code exists yet. Protocol version 1."*
 
 No CRITICAL security vulnerability was found: single-use pairing, the attempt cap, transcript binding, constant-time confirmation, per-channel sequencing, and decode-side bounds all hold. The E-code catalogue and wire message table are fully consistent (71/71 codes, 19/19 messages).
 
@@ -24,14 +34,14 @@ No CRITICAL security vulnerability was found: single-use pairing, the attempt ca
 | `go vet ./...` | clean |
 | `go build ./...` | clean |
 | `go test -race -count=1 ./...` | **13/13 packages pass** |
-| Coverage (`-coverpkg=./...`, `make cover-check` equiv.) | **85.0 %** (min 80 %) — passes |
+| Coverage (`-coverpkg=./...`, `make cover-check` equiv.) | **84.7 %** (min 80 %) — passes |
 | `make check-goroutines` on the real tree | clean (17 runtime goroutines all via `obs.Go`; zero bare `go`) |
 | Bare-`go` grep (repo-wide, non-test) | zero violations |
 | E-code catalogue vs §14.2 | 71/71 present, 0 semantic mismatches, retry classes match §14.3 |
 | Message catalogue vs §9.2 | 19/19 present, directions + bodies match; goldens re-synced to v2 `group_bytes` |
 | Key schedule vs §6.3 | all 7 derived values independently recomputed = golden vectors |
 | System-file exclusion **sets** vs §10.1.1 | macOS 18/18, Windows 22/22, Linux/Unix 6/6 byte-exact |
-| `make ci` / `make verify` | **currently RED — false positive** (see R-04) |
+| `make ci` / `make verify` | **green** (exit 0, 2026-09-08; was a false-positive RED via the `.claude/` worktree — R-05, resolved) |
 
 ---
 
@@ -51,21 +61,23 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 - Impact: receiver dies on E7003 disk-full / E3005 mid-transfer → sender sees EOF → exits 0, prints "ok". The two machines disagree on the outcome — exactly the cross-host inconsistency §14.4 exists to prevent; automation and resume decisions trust a success that was a failure.
 - Evidence: `grep '&wire.Error' internal/` → only `sender/run.go:60` (production). No `peer=true` field is ever emitted in a log (grep confirms).
 
-**R-03 · Excluded directories are not pruned — their contents are transferred** · `HIGH` · M · NEW
+**R-03 · Excluded directories are not pruned — their contents are transferred** · `HIGH` · M · NEW · **RESOLVED 2026-09-08 by `75fbff4`** (see delta; MEMORY.md MFR-0009)
 - Docs: §10.1 ("directory entries **pruned**, not descended into"), REQ-SCAN-026, REQ-CLI-011. Code: `sender/walk.go` descends into every directory (only `.esync` and — never-set — `skipAbs` are skipped); exclusion runs later in `plan.Build` (`plan.go:115-140`), testing each entry's **final component alone**, and the `Prune` flag it computes is recorded on an `Exclusion` record that nothing ever consumes.
 - Impact: children of `.Trash-1000`, `$RECYCLE.BIN`, `lost+found`, `__MACOSX`, and of any `--exclude dir` survive, get file ids, fold into the manifest digest, and are transferred. Silent wrong output of a P0 scan requirement; the digest is polluted too, so a later fix changes resume identity. (Found independently by two audits.)
 - Evidence: `filter.go:71` comment ("the walker prunes … so its children never reach Build") describes behavior that does not exist; `Exclusion.Prune` (`plan.go:127`) has no consumer; `MatchSystemFile` is called nowhere in `internal/sender`.
 - Fix shapes: prune in the walker (give `walkConfig` the rule set) or ancestor-state tracking in `Build`. A test seeding a file inside a pruned dir currently passes — add it first (sysfiles_test seeds only dir names).
+- Status 2026-09-08: **RESOLVED** - two-pass subtree pruning in `plan.Build` (commit `75fbff4`); tests in `internal/plan/prune_test.go`.
 
 **R-04 · Verification matrix §18.1 is largely fabricated and "mechanically checked" is false** · `HIGH` · M (checker) + backlog · NEW
 - Docs: §18.1 ("This table is mechanically checked … fails the documentation check in CI"), §18.2 ("154/154 requirements have ≥1 artefact"). Code: no check exists anywhere.
 - Evidence (reproduced): 156 matrix rows cite **174 unique artefact ids; ≥104 never appear in any `.go` file** (53 T-, 15 F-, 13 E2E-, 7 B-, 7 D-, 21 I-, 1 Z- in the full audit; 104/174 by direct grep). The "present" remainder are `// T-RES-01` comment annotations on tests, not test names — so even the letter of "test names cover ids" holds for zero ids.
 - Impact: a requirement "verified" by `F-NET-01` / `E2E-09` / `B-THRU-03` has no proof; the doc's coverage claim is fiction. Fix: add a `make traceability` checker (matrix ids ↔ test names, run in CI) and make it pass one of two ways per row — real test, or an honest "deferred" marker. Do **not** silently renumber tests to match ids.
 
-**R-05 · `make ci` is RED from a false positive: `.claude/` worktree is scanned by `check-goroutines`** · `MED` · S · NEW
-- Code: `Makefile:117-124` — `find` does not exclude the untracked nested git worktree `.claude/worktrees/e9002-drain-progress/`, whose stale copy of `internal/obs/goroutine.go` trips the rule; `make fuzz` has the same globbing issue.
-- Impact: the pre-commit gate fails for a reason unrelated to the real tree; `make ci`/`make verify` cannot currently be the trusted entry point R-01 should run.
-- Evidence: reproduced exit 1; also the grep pattern misses `go x()` spawned inline after `{` (false-negative window worth closing while there).
+**R-05 · `make ci` is RED from a false positive: `.claude/` worktree is scanned by `check-goroutines`** · `MED` · S · NEW · **RESOLVED 2026-09-08**
+- Code: `Makefile:117-124` — `find` did not exclude the untracked nested git worktree `.claude/worktrees/e9002-drain-progress/`, whose stale copy of `internal/obs/goroutine.go` tripped the rule; `make fuzz` had the same globbing issue.
+- Impact: the pre-commit gate failed for a reason unrelated to the real tree; `make ci`/`make verify` could not be the trusted entry point R-01 should run.
+- Evidence: reproduced exit 1.
+- Status 2026-09-08: **RESOLVED** — the stale worktree copy is gone and `make ci` exits 0 (re-run today). Open hardening: the grep pattern still misses `go x()` spawned inline after `{`; and R-01 (CI workflow runs only `make dist`, no test job) remains open.
 
 **R-06 · Doc header contradicts the shipped tree — "No code exists yet", "Protocol version 1", v0.2.0 dated 2026-09-04** · `MED` · S · NEW
 - Evidence: `ARCHITECTURE.md:1-16` banner; body itself documents the "protocol_version bump (1 → 2)" (§10.4); code is v2 (`handshake.go:36`, `plan.go:68`); §21 revision history's newest entry is 09-04 — the 09-07 sessions in MEMORY.md are unrecorded. Header status/version fields are the first thing a reader checks; they misstate the wire format.
@@ -84,8 +96,9 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 **R-08 · Receiver summary never lists failed items** · `MED` · S · NEW
 - Docs: §14.3 ("named in the summary"), §15.7 `failed items:` block. Code: `obs.Summary` accepts a `failedItems` variadic but `receiver/run.go:308` calls it empty; the fetch loop tallies `FilesFailed` but never accumulates id/path/code. The documented "which files failed and why, at a glance" is absent on the receiver.
 
-**R-09 · Second-signal force-exit unimplemented; `--shutdown-grace` parsed-only no-op** · `MED` · M · KNOWN-half
-- Docs: §14.7 / REQ-CLI-010 ("a second signal within the grace period exits immediately with 5 and no summary"). Code: both `signal.watch` goroutines (`sender/run.go:147`, `receiver/run.go:456`) handle exactly one signal; a second SIGINT is dropped; `shutdownGrace` (`cli.go:78`) is never plumbed to either run path. First-signal behavior (cancel → journal fsync → resume command → exit 5) is correct.
+**R-09 · Second-signal force-exit unimplemented; `--shutdown-grace` parsed-only no-op** · `MED` · M · KNOWN-half · **RESOLVED 2026-09-08 by `ae19178`** (see delta)
+- Docs: §14.7 / REQ-CLI-010 ("a second signal within the grace period exits immediately with 5 and no summary"). Code (then): both `signal.watch` goroutines (`sender/run.go:147`, `receiver/run.go:456`) handled exactly one signal; a second SIGINT was dropped; `shutdownGrace` (`cli.go:78`) was never plumbed to either run path. First-signal behavior (cancel → journal fsync → resume command → exit 5) was correct.
+- Status 2026-09-08: **RESOLVED** — `cli.go` `signalEscape` (second signal or grace expiry → flush + exit 5) is wired via `installSignalEscape` in both `runSender` (`cli.go:324`) and `runReceiver` (`cli.go:426`); the receiver closes the control conn on first signal so the graceful drain is prompt. MFR-0008, covered by `cli_test.go`.
 
 **R-10 · Dry-run writes to disk: destination directory is created and probed** · `MED` · S · NEW
 - Docs: REQ-CLI-009 ("write nothing to disk"), §16.3. Code: `receiver/run.go:388` `os.MkdirAll(destPath)` + `checkWritable` (:389) run unconditionally; only later stages sit behind `!cfg.DryRun`. A dry-run leaves an empty directory behind and fails on a read-only destination it would never write to.
@@ -132,8 +145,9 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 **R-23 · Walk-skip counts never reach the summary or exit code** · `LOW` · S · NEW
 - Docs: REQ-SCAN-032 (count in final summary, affects exit), §14.6 (exit 1 covers skipped). Code: E6005/6/7 skips go only into `SCAN_COMPLETE.skipped_entries` (`sender/manifest.go:63`); `SESSION_SUMMARY.FilesSkipped` (`run.go:392-396`) omits them, and the exit switch keys on `FilesFailed` only (`run.go:60-70`) → an unreadable subtree prints nothing and exits 0.
 
-**R-24 · Channel-loss handling: a clean close of one data channel is fatal E3005; §7.3 rejoin is absent** · `MED` · M · NEW
+**R-24 · Channel-loss handling: a clean close of one data channel is fatal E3005; §7.3 rejoin is absent** · `MED` · M · NEW · **RESOLVED 2026-09-08 by `a6d5c6f`** (see delta; MEMORY.md MFR-0010)
 - Docs: §7.3 (recoverable row: requeue + CHANNEL_JOIN retry ×3 + retire), REQ-NET-008. Code: no rejoin/retire machinery — `addChannel` is tuner-driven only; a dead channel's fetcher burns per-item `--max-retries` on a wedged conn and a *clean* FIN maps to fatal non-retryable E3005 (`fetch.go:244-254`), the opposite of the doc's recoverable row. The narrow-but-real "one data flow dies, control survives" case degrades to zombie retries or aborts the whole transfer.
+- Status 2026-09-08: **RESOLVED** - recoverable-loss classification + rejoin machinery (commit `a6d5c6f`); tests in `internal/receiver/rejoin_test.go`.
 
 ---
 
@@ -142,7 +156,7 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 | # | Feature | Doc / REQ | Effort | Status |
 |---|---|---|---|---|
 | R-25 | `.part` checkpoint resume (verified-offset truncation, `parts/<id>.state`) | §11.4, §12.6, XFER-041, F-SIG-02 | L | KNOWN — stubbed (`fetch.go:116`, digest.Marshal unused) |
-| R-26 | SESSION_RESUME suspend/re-dial within `--resume-window` | §7.3, REQ-NET-009, E3007 | XL | KNOWN — wire type only |
+| R-26 | SESSION_RESUME suspend/re-dial within `--resume-window` | §7.3, REQ-NET-009, E3007 | XL | **Design delivered** (`doc/SESSION_RESUME_DESIGN.md`); code awaits sign-off on D1–D4 |
 | R-27 | External merge sort above spill threshold | §10.3, REQ-SCAN-033, NFR-010 | XL | KNOWN — in-memory always |
 | R-28 | Fault-injection suite (18 scenarios; **needs inject seams** compiled-in-but-inert) | §19.4, REQ-VER-005 (P0) | XL | NEW — 0 tests, 0 seams |
 | R-29 | E2E suite beyond E2E-01 (50 k-file, second-run-zero-bytes, NFD↔NFC, dry-run, no-delete, code-race E2005, sys-v1 exclusion …) | §19.3 E2E-02..14 | L | NEW — 1/14; current E2E is in-process, not "real processes" |
@@ -180,6 +194,8 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 - **Symlink replacement is remove-then-create**, not create-temp+rename (§12.3) — non-atomic window.
 - **MEMORY.md** inaccuracies to fix while editing: sender heartbeat described as "file ids ÷ 1024" (code uses real wire group ids — correct already); ".part checkpoint" described as deferred without noting `digest.Marshal` exists; FILE_CANCEL "WONTFIX" reasoning stale (R-36). Coverage notes should name `Run/pair/acceptData/sessionParams` as the truly untested sender code (walk.go has 5 unit tests).
 - **AGENTS.md**: "no CI workflow file yet" (exists — R-01); check-goroutines / coverage descriptions updated for the above.
+- **SCAN_PROGRESS (0x10) is never emitted** — codec-only (`wire/msgtype.go:29`, `frame.go:178`); the sender has no emit site and a receiver would E5001 it. Emit during long walks or scrub §9.3's row.
+- **PING/PONG RTT never reaches the tuner** — keepalive is liveness-only (`channel/channel.go:192-243`); `receiver/tune.go` uses goodput + error counters only, so §9.2/§13.4's "RTT measurement feeding the tuner" over-promises.
 
 ---
 
@@ -195,7 +211,7 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 - **Path safety ordering:** manifest entries validated + collision-checked before any fs call; skip-check Lstat confined through `os.Root`.
 - **Goroutine rule:** zero bare goroutines; all 17 through `obs.Go`.
 - **Queue/pipeline bounds:** bounded manifest channel (2·credit+8), queue cap 4096, backpressure end-to-end; no unbounded goroutine pile-up.
-- **Coverage 85.0 %** total (`-coverpkg`); **all 13 packages pass `-race`**.
+- **Coverage 84.7 %** total (`-coverpkg`, re-run 2026-09-08); **all 13 packages pass `-race`**.
 
 ---
 

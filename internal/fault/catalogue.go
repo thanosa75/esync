@@ -132,7 +132,7 @@ var catalogue = map[Code]policy{
 	E3002: {Fatal, false, "connect timeout on all candidates", "check LAN connectivity and firewall"},
 	E3003: {Item, true, "connection reset mid-session", "automatic: requeue and rejoin; fatal if the control channel and resume fails"},
 	E3004: {Fatal, false, "peer unresponsive past the keepalive deadline", "check the other machine; resume with the same command"},
-	E3005: {Fatal, false, "a data channel is lost, idle past the stall timeout, or the last one retired", "re-run; the receiver resumes from its journal"},
+	E3005: {Fatal, false, "unrecoverable data-channel failure: idle past the stall timeout, the last channel retired with work outstanding, or a coded channel fault", "re-run; the receiver resumes from its journal"},
 	E3006: {Item, true, "CHANNEL_JOIN rejected", "automatic retry; channel retired on exhaustion"},
 	E3007: {Fatal, false, "control channel resume window expired", "re-run; the receiver resumes from its journal"},
 
