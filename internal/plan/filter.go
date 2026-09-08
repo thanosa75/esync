@@ -66,9 +66,10 @@ func validateFilters(rules []FilterRule) error {
 // last match wins. With no matching rule the entry is admitted.
 //
 // Subset (documented follow-up): a rule matches the path itself or its basename,
-// honours a leading "/" anchor and a trailing "/" directory marker; "**" and
-// implicit "exclude a directory ⇒ exclude its contents" are not modelled here —
-// the walker prunes an excluded directory so its children never reach Build.
+// honours a leading "/" anchor and a trailing "/" directory marker; "**" is not
+// modelled here. Excluding a directory excludes its contents: Build prunes the
+// matched directory's whole subtree (§10.1), so a later rule cannot re-admit a
+// path beneath it.
 func (o Options) filterAdmits(slashPath string, isDir bool) (admit bool, rule string) {
 	admit = true
 	for _, r := range o.Filters {

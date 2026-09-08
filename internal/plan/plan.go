@@ -76,7 +76,9 @@ const (
 )
 
 // Exclusion records one entry removed before the plan (§10.1.1, §10.1). Prune is
-// true for a directory the walker must not descend into.
+// true for a directory whose whole subtree is dropped ("pruned, not descended
+// into"). Entries beneath a pruned directory are not recorded: they are dropped
+// silently, as if the walker never enumerated them.
 type Exclusion struct {
 	Path  []byte
 	Rule  string
@@ -100,6 +102,16 @@ type Plan struct {
 // Build applies the system-file exclusion set and the user filters, sorts the
 // survivors by the §10.2 ordering key, groups them, and computes the manifest
 // digest (§10.5). The input slice is not retained.
+//
+// Exclusion is applied as pruning, not entry-by-entry: when a directory matches
+// the sys set or is excluded by a user filter, its whole subtree is dropped
+// (§10.1, "directory entries pruned, not descended into"). Build's input may
+// arrive in any order, so the pruned prefixes are collected in a first pass and
+// applied in a second — the outcome is a pure function of the entry set
+// (P-SCAN-01), and a user filter can never re-admit a path beneath a pruned
+// directory (sys set first, §10.1 rule order). Entries dropped by subtree
+// pruning are not counted or recorded individually: the walker would never have
+// enumerated them.
 func Build(entries []Entry, opts Options) (*Plan, error) {
 	if err := validateFilters(opts.Filters); err != nil {
 		return nil, err
@@ -107,43 +119,67 @@ func Build(entries []Entry, opts Options) (*Plan, error) {
 
 	p := &Plan{filterSig: opts.FilterSignature()}
 
+	// Pass 1: classify every entry — sys set first (a user filter cannot re-admit
+	// a sys-excluded entry), then the ordered user filters (last match wins). A
+	// directory whose own name is excluded marks its subtree for pruning.
+	type dec struct {
+		e        Entry
+		slash    []byte
+		rule     string // matched rule; "" when admitted
+		pruneDir bool   // a directory whose subtree is dropped
+		dropped  bool   // own-name exclusion (file drop or dir prune)
+	}
+	decs := make([]dec, 0, len(entries))
+	pruned := make(map[string]bool, len(entries)/8)
+
+	for _, e := range entries {
+		slash := toSlash(e.RelPath)
+		d := dec{e: e, slash: slash}
+		if !opts.KeepSystemFiles {
+			if rule, prune, ok := MatchSystemFile(finalComponent(slash), e.Type == TypeDir, atRoot(slash)); ok {
+				d.dropped, d.rule, d.pruneDir = true, rule, prune
+			}
+		}
+		if !d.dropped {
+			if admit, rule := opts.filterAdmits(string(slash), e.Type == TypeDir); !admit {
+				d.dropped = true
+				d.rule = "filter:" + rule
+				d.pruneDir = e.Type == TypeDir
+			}
+		}
+		if d.pruneDir {
+			pruned[string(slash)] = true
+		}
+		decs = append(decs, d)
+	}
+
+	// Pass 2: apply. Subtree drops take precedence over everything else: an entry
+	// beneath a pruned directory is gone whether or not its own name matches.
 	type keyed struct {
 		e    Entry
 		key  []byte
 		orig []byte
 	}
-	ks := make([]keyed, 0, len(entries))
-
-	for _, e := range entries {
-		slash := toSlash(e.RelPath)
-
-		if !opts.KeepSystemFiles {
-			if rule, prune, ok := MatchSystemFile(finalComponent(slash), e.Type == TypeDir, atRoot(slash)); ok {
-				p.exclusions = append(p.exclusions, Exclusion{
-					Path:  clone(e.RelPath),
-					Rule:  rule,
-					Prune: prune,
-				})
-				p.ExcludedCount++
-				continue
-			}
+	ks := make([]keyed, 0, len(decs))
+	for _, d := range decs {
+		if underPruned(pruned, d.slash) {
+			continue
 		}
-
-		if admit, rule := opts.filterAdmits(string(slash), e.Type == TypeDir); !admit {
+		if d.dropped {
 			p.exclusions = append(p.exclusions, Exclusion{
-				Path:  clone(e.RelPath),
-				Rule:  "filter:" + rule,
-				Prune: e.Type == TypeDir,
+				Path:  clone(d.e.RelPath),
+				Rule:  d.rule,
+				Prune: d.pruneDir,
 			})
 			p.ExcludedCount++
 			continue
 		}
 
-		key, nonUTF8 := orderingKey(slash)
+		key, nonUTF8 := orderingKey(d.slash)
 		if nonUTF8 {
-			e.Flags |= FlagNameNonUTF8
+			d.e.Flags |= FlagNameNonUTF8
 		}
-		ks = append(ks, keyed{e: e, key: key, orig: slash})
+		ks = append(ks, keyed{e: d.e, key: key, orig: d.slash})
 	}
 
 	if len(ks) > spillThreshold {
@@ -246,6 +282,24 @@ func finalComponent(slash []byte) []byte {
 }
 
 func atRoot(slash []byte) bool { return bytes.IndexByte(slash, '/') < 0 }
+
+// underPruned reports whether slash lies strictly beneath a pruned directory
+// prefix (i.e. below some ancestor whose path is in pruned). The entry's own
+// path is never tested: a pruned directory itself is handled by its own
+// exclusion decision.
+func underPruned(pruned map[string]bool, slash []byte) bool {
+	start := 0
+	for {
+		j := bytes.IndexByte(slash[start:], '/')
+		if j < 0 {
+			return false
+		}
+		if pruned[string(slash[:start+j])] {
+			return true
+		}
+		start += j + 1
+	}
+}
 
 func clone(b []byte) []byte { return append([]byte(nil), b...) }
 
