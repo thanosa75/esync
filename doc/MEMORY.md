@@ -188,136 +188,139 @@ walk mode legitimately serves content through symlinks that escape the root.
 
 ---
 
+MFR-0016 · sender/receiver run · BOTH sides must tell the peer why a session
+  died. The receiver used to return from every fatal path without sending
+  anything, so the sender saw a bare EOF on the control channel, treated it as a
+  clean end of session, and exited 0 printing "ok" while the destination was
+  broken (disk full, stall, protocol fault). Any new fatal path on either side
+  must route through that side's notify-peer guard — send-once, skipped for a
+  signal interrupt, best-effort so it can never block shutdown or become a second
+  fatal. §14.4 / REQ-ERR-005: both sides log the same cause. Beware when testing
+  this: a wrong-reason fatal (e.g. the generic E5001 "unexpected control message")
+  produces the same non-zero exit, so a test MUST assert the peer's actual E-code
+  reached the log, not merely that the exit was non-zero.
+
+MFR-0017 · plan/wire/record · Any control message assembled from an UNBOUNDED
+  collection must be capped at build time against the record ceiling, not merely
+  documented. GROUP_MANIFEST was capped by entry count and by *file* bytes, never
+  by its own encoded size, so a deep or vendored tree produced a record above the
+  ceiling, the sender died with E5003, and the resume journal replayed the same
+  group forever — a deterministic, workaround-free failure on legal input. Cap by
+  the real encoder's per-entry size, and when a field's true value is not known at
+  build time (digests are hashed lazily, after grouping) use the wire's maximum so
+  the estimate can only OVERestimate. An underestimate re-opens the bug. Keep the
+  ceiling single-sourced: sender and receiver deriving it separately is a wire
+  break waiting to happen.
+
+MFR-0018 · receiver/hardlink · A hard-link secondary must NEVER depend solely on
+  its primary publishing. Secondaries were parked until the primary published, so
+  a primary resolved by SKIP left them parked forever — absent from the
+  destination, journal clean, exit 0. A failed link was likewise warn-only. Every
+  path that resolves a primary must materialise its parked secondaries, and any
+  link failure must fall back to fetching the secondary's content (§12.4 /
+  REQ-FS-003), with a FilesFailed increment as the last-resort safety net. The
+  rule generalises: warn-only is never an acceptable outcome for a file the plan
+  says belongs in the destination.
+
+MFR-0019 · receiver/queue · NEVER call a capacity-blocking push from the
+  goroutine that pops the queue. The hard-link content fallback (MFR-0018) first
+  used `pushGroup`, which blocks while the queue is full, from inside `finish()`
+  — which runs on a fetcher worker, i.e. a popper. With the queue at capacity and
+  every worker in that path, nothing was left to pop, so no slot could ever free:
+  the drain deadlocked until the watchdog fired a misleading E9002 ("stalled" for
+  a session that was not). Enqueue paths reachable from a worker use
+  `pushFallback`, which never blocks and overshoots capacity by a bounded amount.
+  Blocking backpressure is correct only on the decide side, which is not a popper.
+
+MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must be
+  threaded to the exit decision, not just into a progress message. Walk-skipped
+  entries (E6005/6/7) were counted by the walker and reported in SCAN_COMPLETE,
+  then dropped: they never reached SESSION_SUMMARY and the exit switch keyed on
+  failures alone, so an unreadable subtree exited 0. REQ-SCAN-032 / §14.6. When
+  testing an exit code, assert the *reason* too (here: outcome "partial" with
+  FilesFailed == 0), or a failure-driven exit 1 will masquerade as the case under
+  test.
+
 ## Session Log
 
-### 2026-09-22 — bug-hunt tier 1: cancelled-worker data loss, unbounded join read, serve TOCTOU
+### 2026-09-23 — owner-directed fix pass (R-02/12/13/16/19/22/23)
 
-- 4-agent bug hunt (Sonnet) against HEAD `d9177b3` + independent source
-  verification; findings ranked by ROI. The top 5 were: (1) cancelled fetch
-  worker drops files, (2) E7004 retry desyncs the data channel, (3) unbounded
-  CHANNEL_JOIN read, (4) serve() reopen-by-path TOCTOU, (5) digest-cache ctime
-  second-granularity. This session fixed 1/3/4 (MFR-0011/0012/0013); 2 and 5 are
-  deferred for a design/spec decision (see follow-ups).
-- All three were invisible to the suite: every new test fails on the pre-fix
-  tree for exactly the intended reason (verified by stashing the fixes), and the
-  serve test's pre-fix failure is a `FILE_HEADER` — i.e. the outside content was
-  already being streamed.
-- New tests: `receiver/fetch_test.go` `TestFetchCancelledMidFetchRequeues`,
-  `TestFetchCancelledDuringBackoffRequeues` (the stub server cancels *before*
-  answering, so the fetcher is guaranteed to observe a cancelled ctx — no sleep
-  race; the backoff case pushes `attempt: 1` so the un-jittered `rnd == nil`
-  delay is 400ms, a wide cancel window). `sender/run_test.go`
-  `TestAcceptDataBoundsChannelJoinRead` (a silent dialer; the listener is closed
-  500ms in — only a bounded join read lets `acceptData` get back to `Accept` and
-  notice). `sender/serve_test.go` `TestServeRejectsSwappedFileIdentity`
-  (same-size symlink to an outside file swapped in post-scan → E6003 before any
-  chunk).
-- Full gate green: `make ci` (tidy-check, fmt-check, vet, check-goroutines,
-  cover-check) — coverage 85.2%, up from 84.7%.
-- Follow-ups added: **(a)** item 2 — a retryable E7004 aborts the chunk loop
-  mid-file while the worker keeps the channel, so the remaining FILE_CHUNKs of
-  the dead request are read as the *next* request's data. E7004 is the ONLY
-  item-class retryable that does this (E5001/E5006/E7003 are fatal and tear the
-  session down), i.e. the one error the catalogue marks retryable is exactly the
-  one that breaks the protocol. Needs a design call: drain-to-FILE_COMPLETE
-  before requeue, or tag FILE_CHUNK with the request id and discard stale ones.
-  **(b)** item 5 — `digest.CacheKey` has `CtimeSec` and no `CtimeNsec`, so a
-  sub-second mtime-preserving rewrite reuses a stale digest; ARCHITECTURE.md:1022
-  specifies that key, so fixing it is a spec change, not just a code change.
-  **(c)** R-01 — `.github/workflows/build.yml` runs only `make dist`: no test,
-  race, vet, or coverage job, and it publishes a rolling `latest` release on
-  every push to main.
-- **Follow-ups (a) and (b) were then decided and implemented in the same
-  session.** (a) item 2 → option **B**, drop the channel (MFR-0014): `fetchOne`
-  is a named-return with a `streaming` flag set at the FILE_HEADER and cleared
-  at FILE_COMPLETE/FILE_ERROR, and a deferred wrap tags anything returned in
-  that window as `desynced`; `loop` reads the tag, applies the item's normal
-  fate, then returns `lostChannel=true`. Tests
-  `TestFetchMidStreamErrorDropsChannel{,WhenRetriesExhausted}` force a
-  deterministic mid-stream E7001 by occupying `.esync/parts/<id>.part` with a
-  *directory* (EISDIR → item-class, retryable) — a reusable lever for any
-  "destination write fails mid-file" test. (b) item 5 → fixed as a **spec
-  erratum** (MFR-0015): `CtimeNsec` added to `CacheKey`, `keyLen` 49→57,
-  `cacheMagic` v1→v2, both `statkey_linux.go` and `statkey_darwin.go`
-  populated, and ARCHITECTURE §11.3 amended with a dated erratum block.
-- Final gate after all five changes: `make ci` green, coverage 85.4%.
-- Remaining known gaps, ROI-ranked, are in STATUS_SUMMARY.md; the live top
-  three are R-01 (CI runs no tests at all), the sender's `--owner`/
-  `--shutdown-grace`/`--spill-threshold` flags being parsed but not wired, and
-  SESSION_RESUME being designed but not implemented.
+- Seven owner-selected findings fixed by four Sonnet agents in one worktree,
+  partitioned by strict file ownership, then reviewed by an Opus pass.
+  MFR-0016..0020 record the five that are bug *rules*; R-22 (--version reports
+  the wire protocol) and R-19 (--compact-code) are feature gaps, not rules.
+- Two new findings surfaced from the fixes themselves and are in
+  STATUS_SUMMARY.md: **R-42**, a drain deadlock the R-16 fallback introduced
+  (fixed here, MFR-0019); **R-43**, a test-only mutable global A4 added to
+  cli.go, refactored away into a pure `senderConfig(args)` builder — the
+  resulting test is strictly stronger, since an unregistered flag now surfaces
+  as a usage exit instead of being silently ignored.
+- Process note that paid off twice: require every fix to carry a test proven to
+  FAIL on the pre-fix tree, and capture that failure verbatim. It caught R-42
+  (routing pushFallback back through pushGroup hangs the test at its 2s guard)
+  and the R-43 seam. Decline to fabricate a proof only when the behaviour did
+  not exist in any form before (TestCompactEndpoints).
+- Remaining work, ROI-ordered, is in `ROI-fixes-Review-20260922.md`: Tier A
+  highest ROI (CI gap R-01, key zeroing R-21, statfs fail-open, drain watchdog,
+  failed-item list R-08, dry-run writes R-10), Tier B real bugs (`.esync`
+  case-fold is the last data-destruction path), Tier C doc integrity, Tier D
+  deferred features, plus six owner decisions.
 
-### 2026-09-08 — audit-driven hardening: excluded-dir pruning (R-03) + data-channel-loss recovery (R-24)
+### 2026-09-22 — bug-hunt tier 1 (condensed)
 
-- Re-audit (3 agents, HEAD `ae19178`) confirmed the STATUS_SUMMARY findings; this
-  session resolved two of the three HIGH gaps the operator prioritised.
-- **R-03 / gap 3 — excluded directories now prune their whole subtree (MFR-0009).**
-  `plan.Build` classified per entry and recorded `Exclusion.Prune` but never
-  dropped the contents of an excluded directory — children of `.Trash-1000`,
-  `__MACOSX`, `lost+found` and of any `--exclude` dir survived into the plan,
-  took file ids, polluted the manifest digest + resume identity, and were
-  transferred. Fixed with a two-pass Build (classify all entries → collect pruned
-  prefixes → drop anything beneath one); subtree drops are silent (no per-child
-  record/count), dominating any rule, order-independent (P-SCAN-01 preserved;
-  `TestPruneOrderIndependent` shuffles a child before its pruned parent). Tests:
-  `internal/plan/prune_test.go` (sys-dir contents incl. deeper prefix rules,
-  filter-excluded dir subtrees, digest equality with a never-walked tree).
-  Commit 75fbff4.
-- **R-24 / gap 2 — a lost data channel is recoverable, not fatal (MFR-0010).**
-  Receiver: raw transport errors (EOF/socket death, no E-code) classify as
-  recoverable channel loss — the in-flight file is requeued (never failed/
-  counted) and the worker ends; a `channel.rejoin` goroutine re-dials with a
-  fresh CHANNEL_JOIN (0.5/2/8 s), fresh id = fresh keys+seq; exhaustion retires
-  the channel, and the last one retiring with work queued is E3005. Stall
-  (RecvMsgTimeout) and coded record/auth faults stay fatal. `dialOneData` bounds
-  the join round-trip. Sender: a servicer transport error logs + exits (conn
-  closed) instead of killing the session; `join.accept` now runs for the whole
-  session; a request that dies with its channel is dropped unresolved
-  (`reqFailed(resolve=false)`) so the tracker never leaks an in-flight slot.
-  E3005 catalogue/§14.2 wording synced (stall / last-retired / coded fault).
-  Tests: `internal/receiver/rejoin_test.go` (real TCP + handshake + record
-  layer): mid-file kill recovers with both files published and exit 0; idle
-  loss recovers; rejoin exhaustion → E3005. Commit a6d5c6f.
-- **Gap 1 (SESSION_RESUME suspend/re-dial) — design delivered, code awaits
-  sign-off.** The doc is internally contradictory on this feature (E3004 vs
-  E3007 for expiry; "fresh handshake" vs single-use code/RISK-04; 0x70 body and
-  `LastSeqSeen` undefined). Implementing blind would guess at a security-
-  critical protocol; instead `doc/SESSION_RESUME_DESIGN.md` pins one concrete
-  contract (reuse ch-0 keys on the re-dialed conn, 0x70 as first frame,
-  E3007-on-expiry, sender replay ring keyed by `LastSeqSeen`) and asks the
-  operator to confirm D1–D4 before the implementation (change list items 1–7 in
-  that doc).
-- Gates: gofmt/vet/build clean, `go test -race ./...` all green, full-suite
-  `-coverpkg` still passes (plan 93.5%, receiver 84.2% in isolation).
+- 4-agent Sonnet bug hunt at HEAD `d9177b3`, ROI-ranked, independently
+  re-verified in source. Five findings, all five fixed this session:
+  cancelled-worker data loss (MFR-0011), mid-stream desync (MFR-0014),
+  unbounded CHANNEL_JOIN read (MFR-0012), `serve()` reopen-by-path TOCTOU
+  (MFR-0013), digest-cache ctime granularity (MFR-0015, a spec erratum).
+- All five were invisible to the suite; every new test was proven to fail on the
+  pre-fix tree. The `serve` test's pre-fix failure is a `FILE_HEADER` — direct
+  evidence the outside file was already being streamed.
+- Two reusable test levers found here: a stub server that cancels *before*
+  answering (no sleep race, since the fetcher is parked in the receive), and
+  occupying `.esync/parts/<id>.part` with a **directory** to force a
+  deterministic mid-stream EISDIR → E7001 (item-class, retryable) without any
+  I/O fault injection.
+- Gate: `make ci` green, coverage 85.4 % (from 84.7 %).
 
-### 2026-09-08 — Ctrl-C not handled: signal force-exit backstop (MFR-0008)
+### 2026-09-08 — audit-driven hardening (condensed)
+
+- **R-03 — excluded directories now prune their whole subtree (MFR-0009).**
+  `plan.Build` recorded `Exclusion.Prune` but never dropped an excluded
+  directory's contents, so children took file ids, polluted the manifest digest
+  and resume identity, and were transferred. Fixed with a two-pass Build
+  (classify → collect pruned prefixes → drop anything beneath one); subtree
+  drops are silent, dominate any rule, and are order-independent (P-SCAN-01).
+  Tests in `internal/plan/prune_test.go`. Commit `75fbff4`.
+- **R-24 — a lost data channel is recoverable, not fatal (MFR-0010).** Raw
+  transport errors (no E-code) classify as recoverable loss: the in-flight file
+  is requeued (never failed or counted) and `channel.rejoin` re-dials with a
+  fresh CHANNEL_JOIN (0.5/2/8 s; fresh id = fresh keys + seq). Exhaustion
+  retires the channel; the last one retiring with work queued is E3005. Stalls
+  and coded record/auth faults stay fatal. Sender side: a servicer transport
+  error closes only its conn, and a request dying with its channel is dropped
+  unresolved so the tracker never leaks a slot. Tests in
+  `internal/receiver/rejoin_test.go` (real TCP + handshake + records). `a6d5c6f`.
+- **SESSION_RESUME — design delivered, code awaits sign-off.** The doc
+  contradicts itself here (E3004 vs E3007 on expiry; "fresh handshake" vs the
+  single-use code; 0x70 body and `LastSeqSeen` undefined), so implementing blind
+  would guess at a security-critical protocol. `doc/SESSION_RESUME_DESIGN.md`
+  pins one contract and asks the operator to confirm D1–D4 first.
+
+### 2026-09-08 — Ctrl-C not handled: signal force-exit backstop (MFR-0008, condensed)
 
 - Operator: "ctrl-c does not get handled; I have to kill the processes and get
   <defunct> in linux."
-- Root cause: both `Run`s `signal.Notify` SIGINT+SIGTERM and gracefully cancel on
+- Root cause: both `Run`s `signal.Notify` SIGINT+SIGTERM and cancel gracefully on
   the first, which traps every later signal too (and SIGTERM, so plain `kill` is
-  inert) — the buffered sig channel drops them. `--shutdown-grace` had existed as
-  a flag since the 2026-09-04 CLI wiring but was never consumed. A slow/silent
-  graceful stop then looks dead and only `kill -9` works.
-- Fix (`cli.go`): `signalEscape(ctx, sigc, grace, exit)` parks until the first
-  signal (Run owns that one), then exits 5 on a second signal or `grace`
-  elapsing. `installSignalEscape` wires it to real signals + `flush()`+`os.Exit`,
-  called in both `runSender`/`runReceiver` after `installFatalHandler`, fed by
-  `*c.shutdownGrace`. `--shutdown-grace` added to `printUsage`.
-- Also (`receiver/run.go`): `signal.watch` now `ctrl.Close()`s after
-  `s.fail(ErrSignal)` — `control.reader` blocks in `ctrl.RecvMsg()` (no rootCtx
-  awareness), so the decide/fetch pipeline previously waited out the full 5s
-  `workerStopGrace` on every Ctrl-C. Sender's first-signal path was already
-  prompt (`tracker.wait` selects on `ctx.Done`).
-- Tests: `cli_test.go` — `TestSignalEscape{SecondSignal,GraceTimeout,NoSignal}`.
-  `installSignalEscape` stays 0% like its sibling `installFatalHandler` (real
-  `os.Exit`); root `esync` pkg at 73.2% is pre-existing (cli wiring is covered by
-  the e2e test, not unit tests). `make cover-check` 84.7% (min 80%); gofmt/vet/
-  build clean, `go test -race ./...` all green.
-- Follow-up cleared: "`--shutdown-grace` parsed but not consumed" (2026-09-04).
-  Still open: `--spill-threshold` parsed-only, `--owner` not wired into fetch,
-  and T-SIG-01/F-SIG-01 (the traceability matrix expects a signal E2E test; the
-  full first-signal → summary → exit-5 path is still only exercised end-to-end
-  by hand, not in CI).
+  inert). `--shutdown-grace` had been a parsed-only flag since 2026-09-04.
+- Fix (`cli.go`): `signalEscape` parks until the first signal (Run owns that
+  one), then exits 5 on a second signal or on grace elapsing; wired into both run
+  paths. Also `receiver/run.go`: `signal.watch` now closes the control conn after
+  `s.fail(ErrSignal)`, because `control.reader` blocks in `ctrl.RecvMsg()` with no
+  rootCtx awareness and previously waited out the full 5 s worker grace on every
+  Ctrl-C.
+- Tests: `cli_test.go` `TestSignalEscape{SecondSignal,GraceTimeout,NoSignal}`.
 
 ### 2026-09-07 — grouping + reliability bundle (condensed)
 
@@ -342,26 +345,24 @@ walk mode legitimately serves content through symlinks that escape the root.
   disproportionate — see MFR-0014, where its absence turned out to matter.
 
 ### 2026-09-07 — sender E9002 drain watchdog: deadline → inactivity
-- Compressed: fully captured by MFR-0004 and the follow-up line in the
-  grouping+reliability entry. Original: a 43GB/176k-file run died E9002 at
-  ~14:44 with 13GB transferred; the watchdog was armed on `allDecidedCh` while
-  decide ran ~20 min ahead of fetch. Fixed by sampling `tracker.progress`.
+- Fully captured by MFR-0004: a 43GB/176k-file run died E9002 with 13GB sent
+  because the watchdog armed on `allDecidedCh` while decide ran ~20 min ahead of
+  fetch. Fixed by sampling `tracker.progress` instead.
 
 ### 2026-09-07 — 60s groups/channels/bandwidth heartbeat (condensed)
 
 - `internal/obs/heartbeat.go` samples `Counters().Bytes` every 10s and logs
   `groups=… channels=… rate=…` at INFO every 60s. `Stop()` is synchronous (a
   `done` channel the loop closes) so callers can read shared state afterwards
-  without a `-race` hazard. Group ids come from `needQueue.pending` on the
-  receiver (hence `done(groupID)`) and `tracker.inProgressGroups()` on the
-  sender; channel count from a new `activeChannels atomic.Int64`.
+  without a `-race` hazard. Group ids: `needQueue.pending` (receiver, hence
+  `done(groupID)`) and `tracker.inProgressGroups()` (sender); channels from a
+  new `activeChannels atomic.Int64`.
 
 ### 2026-09-07 — Fix: receiver drain watchdog fires mid-transfer (E9002)
-- Compressed: fully captured by MFR-0003. Original: the receiver armed
-  `DrainTimeout + workerStopGrace` from pipeline launch, killing any fetch
-  phase longer than 60s; fixed by arming only once termination is reachable
-  (`decideWg.Wait()`/`q.close()`/`q.waitDrained()`), with `waitGrace` bounding
-  the post-cancel unwind.
+- Fully captured by MFR-0003: the receiver armed `DrainTimeout +
+  workerStopGrace` from pipeline launch, killing any fetch phase longer than
+  60s. Fixed by arming only once termination is reachable (`decideWg.Wait()` /
+  `q.close()` / `q.waitDrained()`), with `waitGrace` bounding the unwind.
 
 ### 2026-09-04 — Adaptive channel tuner (REQ-PAR-004) + sender-side dynamic join (condensed)
 

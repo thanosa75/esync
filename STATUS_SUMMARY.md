@@ -4,6 +4,79 @@
 **Scope:** every non-test package (root, `internal/{channel,crypto,digest,fault,fsx,obs,paircode,plan,receiver,sender,wire}` ≈ 20 kLOC) cross-checked against `doc/ARCHITECTURE.md` (§1–21, incl. the 156-row §18.1 matrix), `doc/INITIAL_REQS.md` (156 REQ-ids), and `doc/MEMORY.md` (MFRs + known follow-ups).
 **Method:** nine parallel subsystem audits (each read its full doc sections + full package source, cited file:line), plus independent re-verification here of the top ~12 load-bearing claims, plus ground-truth gate runs. Effort scale: S <½ d · M 1–2 d · L 3–5 d · XL >5 d. Findings marked **KNOWN** were already listed as MEMORY.md follow-ups; **NEW** were not. No re-reported MFR (fixed bug) appears. **Re-audit 2026-09-08:** three parallel read-only agents (§4–8 security/transport, §9–13 pipeline, §14–21 meta) re-ran the same doc-vs-code check against HEAD `ae19178`; every finding below was re-confirmed with unchanged file:line evidence and no new critical issue surfaced.
 
+### Owner-directed fix pass (2026-09-23, HEAD `fd6e9ff` + working tree)
+
+Seven findings the owner named were fixed by four Sonnet agents under strict
+file ownership, then reviewed end-to-end. Each fix carries a test proven to fail
+on the pre-fix tree. `make ci` green, coverage **86.3 %** (from 85.4 %).
+The ROI-ordered write-up of everything still open is `ROI-fixes-Review-20260922.md`.
+
+- **RESOLVED — R-02** (`HIGH`): the receiver now best-effort sends
+  `wire.Error{Fatal:1}` on the control channel before exiting (`receiver/run.go`
+  `notifyPeer`, send-once, skipped for a signal interrupt), and the sender handles
+  an inbound `*wire.Error` (`sender/run.go` `peerError`) so it exits with the
+  peer's E-code instead of reading a bare EOF as a clean end and printing "ok"
+  (§14.4 / REQ-ERR-005). Tests `sender.TestRunReactsToPeerFatalError`,
+  `receiver.TestRunNotifiesPeerOnFatal`. Note the sender test asserts the log
+  carries `code=E7003`, not merely a non-zero exit — the pre-existing E5001
+  "unexpected control message" path produces the same exit shape and would have
+  made a coarser assertion pass for the wrong reason.
+- **RESOLVED — R-13** (`MED`): the control-record ceiling is now **512 KiB**
+  (`record.MaxCTControl = 1<<19 + blockSize`), single-sourced through the
+  unexported `maxCT(channelID)` that both `NewWriter` and `NewReader` consume, so
+  the two sides cannot drift. Grouping gained a third cap (~520 KB of encoded
+  manifest per group, derived from the real encoder in `wire/frame.go` with
+  file-entry digests pinned to the 64-byte wire ceiling, so the estimate can only
+  overestimate); a single oversize entry is isolated into its own group rather
+  than looping. Entry-count and `--group-bytes` caps are unchanged, and grouping
+  still does not fold into the plan digest (MFR-0006).
+- **RESOLVED — R-16** (`MED`): a hardlink secondary could be absent from the
+  destination with exit 0 on two paths — its primary resolved by SKIP (so the
+  primary never published and `registerMaterialised` never ran), and a deferred
+  link failure that was warn-only. Both now take the §12.4 **content fallback**:
+  the secondary is enqueued as an ordinary needed file, with `FilesFailed` as the
+  safety net if even that cannot be done. Tests
+  `receiver.TestDecideHardlinkMaterialisesSecondaryOnSkippedPrimary`,
+  `receiver.TestFetchHardlinkFallsBackToContentOnLinkFailure`.
+- **RESOLVED — R-23** (`LOW`): walk-skip counts (E6005/6/7) now reach both
+  `SESSION_SUMMARY.FilesSkipped` and the exit decision, so an unreadable subtree
+  yields exit 1 "partial" instead of exit 0 (REQ-SCAN-032, §14.6). Test
+  `sender.TestRunPartialExitOnWalkSkip`. **Caveat, now tracked as open work:**
+  `internal/wire` has no separate field, so this count is conflated with
+  receiver-driven skips and excluded entries in that one wire field.
+- **RESOLVED — R-12** (`MED`): `--drain-timeout` is registered on the sender flag
+  set and wired to `sender.Config.DrainTimeout`, replacing a hardcoded 60 s
+  (§13.7). Picks up `ESYNC_DRAIN_TIMEOUT` for free via the existing `applyEnv`.
+  Test `TestRunSenderDrainTimeout`.
+- **RESOLVED — R-19** (`MED`): `--compact-code` now exists. The flag sets
+  `sender.Config.CompactCode`; `compactEndpoints` truncates to two endpoints and
+  emits the §14.1 WARN whenever more than two remain (stderr — stdout still
+  carries only the pairing code, REQ-CLI-005). Tests `TestRunSenderCompactCode`,
+  `sender.TestCompactEndpoints`.
+- **RESOLVED — R-22** (`LOW`): `--version` now reports the protocol version, read
+  from `wire.ProtocolVersion` rather than a literal (REQ-CLI-008). Test
+  `TestVersionIncludesProtocol`.
+
+Two defects were found and fixed *during* this pass rather than by it:
+
+- **R-42 (NEW, `MED`, S) — drain deadlock introduced by the R-16 fallback.** The
+  fetch-side fallback called the *blocking* `needQueue.pushGroup` from inside
+  `finish()`, which runs on the same goroutine that pops the queue. With the queue
+  at capacity and every fetcher worker in that path, nothing could pop, no slot
+  could free, and the session would hang until the drain watchdog fired a
+  misleading E9002. Added `needQueue.pushFallback`, which never blocks (bounded
+  overshoot, documented on the type). Test
+  `receiver.TestQueuePushFallbackNeverBlocksWhenFull`, proven to fail when the
+  push blocks.
+- **R-43 (NEW, `LOW`, S) — test-only global in production code.** The CLI fix
+  added `var senderConfigForTest func(sender.Config)` to `cli.go` purely so tests
+  could observe the resolved Config. Replaced with a pure `senderConfig(args)`
+  builder that parses and validates without opening a listener, so `runSender` is
+  a thin wrapper and no test-only state ships in the binary. The test is stronger
+  for it: an unregistered flag now surfaces as a usage exit the helper fails on.
+
+---
+
 ### Bug-hunt delta (2026-09-22, HEAD `d9177b3` + working tree)
 
 Four Sonnet agents exercised send/receive on one host hunting for defects the unit
@@ -106,7 +179,7 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 - Impact: every gate is green only when a developer happens to run `make verify` locally; a PR can merge with broken tests or stale golden vectors. This is the single highest-ROI change — it turns R-02…R-04 into enforced invariants.
 - Evidence: workflow steps = checkout → setup-go → `make dist` → upload → release. AGENTS.md ("no CI workflow file yet") is itself stale.
 
-**R-02 · Receiver never notifies the sender of a fatal; sender exits `0` "ok" on receiver-side failure** · `HIGH` · S–M · NEW
+**R-02 · Receiver never notifies the sender of a fatal; sender exits `0` "ok" on receiver-side failure** · `HIGH` · S–M · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Docs: §14.4, REQ-ERR-005 (P0: "both sides log the same cause"). Code: sender sends `wire.Error{fatal:1}` on fatal (`sender/run.go:57-64`); the receiver's `finish()` (`receiver/run.go:286-318`) has no equivalent send, and its control reader treats a bare EOF as a clean end.
 - Impact: receiver dies on E7003 disk-full / E3005 mid-transfer → sender sees EOF → exits 0, prints "ok". The two machines disagree on the outcome — exactly the cross-host inconsistency §14.4 exists to prevent; automation and resume decisions trust a success that was a failure.
 - Evidence: `grep '&wire.Error' internal/` → only `sender/run.go:60` (production). No `peer=true` field is ever emitted in a log (grep confirms).
@@ -156,10 +229,10 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 **R-11 · Fatal-path observability asymmetry: ring dump + summary fire only for goroutine-escalated faults** · `MED` · S–M · NEW
 - Docs: §14.4 step 2 / §15.6 (ring dump on any Fatal), REQ-ERR-031 (summary on fatal exit). Code: `DumpRing` is reachable only via `obs.Go`'s panic/return path (`obs/goroutine.go:38-75`); main-flow fatals (E2006/E3001/E7003/E9002 watchdogs, all `s.fail()`/`setFatal` routes) skip it — and an E9001 panic reaches `OnFatal`, which exits without printing the summary (`cli.go:199-204`). Unify on one fatal funnel.
 
-**R-12 · Sender's `--drain-timeout` is not configurable** · `MED` · S · NEW
+**R-12 · Sender's `--drain-timeout` is not configurable** · `MED` · S · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Docs: §13.7 names `--drain-timeout` for both sides. Code: flag registered only on the receiver FlagSet; sender hardcodes `DrainTimeout: 60s` (`cli.go:290`); `sender.Config.DrainTimeout` is unreachable from the CLI. An operator cannot lengthen the sender watchdog for a slow-but-legit tail.
 
-**R-13 · GROUP_MANIFEST can exceed the control-record ceiling → sender E5003 kills a legal session** · `MED` · M · NEW
+**R-13 · GROUP_MANIFEST can exceed the control-record ceiling → sender E5003 kills a legal session** · `MED` · M · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Docs: §8.1 `MaxCTControl` (256 KiB+16), §10.4 (group ≤1024 entries), §9.3 sizes are "typical-path" only. Code: `sender/manifest.go:117` writes the whole group as one record; record writer rejects padded ct_len > 256 KiB+16 with E5003 (`record/record.go:110-111`). Grouping caps entries by count + **file bytes**, never by encoded manifest size; paths are u16 (up to 64 KiB) with ~100+ B overhead each → worst case megabytes, and ~200 B avg paths already overflow 256 KiB.
 - Impact: deep/vendored trees whose 1024-entry groups average ≳200 B path fail deterministically, and the resume journal replays the same failing group forever.
 
@@ -169,7 +242,7 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 **R-15 · Self-copy guard (FS-045/E1008) is dead code** · `MED` · S · NEW
 - Docs: §10.1 ("destination inside source → skipped WARN", E1008 fatal). Code: `walkConfig.skipAbs` is never set (`sender/run.go:212-217`); `fsx.IsInside` + E1008 have zero production call sites. A same-machine copy into a subtree of the source walks files mid-write → nondeterministic plans/digest mismatches instead of the documented guard.
 
-**R-16 · Hard-link secondary can be silently dropped with exit 0** · `MED` · M · NEW
+**R-16 · Hard-link secondary can be silently dropped with exit 0** · `MED` · M · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Docs: §12.4 / REQ-FS-003 ("correctness preserved" via content fallback). Code: a secondary decided while its primary is still in flight is parked by `claimSecondary` (`receiver/decide.go:364-365`) and is only materialised when the primary publishes (`fetch.go:208-212` `registerMaterialised`); if the primary is **skipped** (prior-resume or identical-content skip) it never publishes and the secondary is never linked *or* fetched; a deferred-link failure at `fetch.go:209` is warn-only with no content fallback and no `FilesFailed`.
 - Impact: hardlinked trees onto link-less destinations (FAT/exFAT/FUSE) or after a resume can end with files absent, journal clean, exit 0.
 
@@ -180,7 +253,7 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 - Docs: §13.2/§13.6 ("need queue … ordered", "Group order itself remains ascending, so progress is monotonic"), queue.go's own invariant comment. Code: up to `GroupCredit`=4 manifests are decided by parallel workers and appended in lock-acquisition order (`queue.go:53-80`), with no per-group barrier.
 - Impact: request streams interleave groups arbitrarily (heartbeat/§13.6 claims overstated) and — worse — FS-044 name-collision winners (E7012) become scheduling-dependent: an identical manifest can yield a different destination tree across runs and after a resume. Decide: enforce group-ordered draining, or soften the doc's monotonicity claim.
 
-**R-19 · `--compact-code` is documented (§16.2, §5.2, §18.1) but the flag does not exist** · `MED` · S · NEW
+**R-19 · `--compact-code` is documented (§16.2, §5.2, §18.1) but the flag does not exist** · `MED` · S · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Code: zero parses of `compact-code`; `eps = eps[:4]` (`sender/run.go:130`) prints up to 4 endpoints with no WARN, so codes can exceed the REQ-PAIR-002 ≤64-char target silently and §14.1's "code with >2 endpoints" WARN never fires. Implement the two-endpoint truncation + WARN, or scrub the rows.
 
 **R-20 · `--owner` is a silent no-op** · `MED` · M (feature) · KNOWN
@@ -189,10 +262,10 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 **R-21 · Redaction/zeroing is partial: derived keys survive every session** · `MED` · S · NEW
 - Docs: §15.9 (code + K_* held in redacted types), REQ-SEC-012 (zeroed at session end). Code: only the 128-bit root secret is zeroed (`sender/run.go:114`, `receiver/run.go:337`); K_pair, PRK, K_conf, K_chan and all per-channel K_enc/K_mac are plain buffers never wiped (`handshake/schedule.go:29-61`); the pairing code itself never lives in a redacted type. **No log leak was found** (nothing logs the code or keys) — this is mechanism-vs-claim drift, not an active leak.
 
-**R-22 · `--version` omits the protocol version** · `LOW` · S · NEW
+**R-22 · `--version` omits the protocol version** · `LOW` · S · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Docs: REQ-CLI-008 requires semantic version, commit, build date **and protocol version** (relevant post 1→2 bump). Code: `main.go:35-37` prints three of the four. Add `wire.ProtocolVersion` to the string.
 
-**R-23 · Walk-skip counts never reach the summary or exit code** · `LOW` · S · NEW
+**R-23 · Walk-skip counts never reach the summary or exit code** · `LOW` · S · NEW · **RESOLVED 2026-09-23** (see owner-directed fix pass)
 - Docs: REQ-SCAN-032 (count in final summary, affects exit), §14.6 (exit 1 covers skipped). Code: E6005/6/7 skips go only into `SCAN_COMPLETE.skipped_entries` (`sender/manifest.go:63`); `SESSION_SUMMARY.FilesSkipped` (`run.go:392-396`) omits them, and the exit switch keys on `FilesFailed` only (`run.go:60-70`) → an unreadable subtree prints nothing and exits 0.
 
 **R-24 · Channel-loss handling: a clean close of one data channel is fatal E3005; §7.3 rejoin is absent** · `MED` · M · NEW · **RESOLVED 2026-09-08 by `a6d5c6f`** (see delta; MEMORY.md MFR-0010)

@@ -305,9 +305,13 @@ func TestRunPartialExitOnWalkSkip(t *testing.T) {
 		sum  Summary
 		exit int
 	}
+	logPath := filepath.Join(t.TempDir(), "sender.log")
+	octx, flush := obs.Init(obs.Config{Sync: true, Role: "sender", File: logPath})
+	defer flush()
+
 	resc := make(chan result, 1)
 	go func() {
-		sum, exit := Run(obs.Ctx{}, Config{
+		sum, exit := Run(octx, Config{
 			SourcePath: srcDir, Bind: "127.0.0.1", Port: 0, MaxChannels: 1,
 			HandshakeTimeout: 5 * time.Second, DrainTimeout: 3 * time.Second,
 		})
@@ -382,18 +386,33 @@ func TestRunPartialExitOnWalkSkip(t *testing.T) {
 	if !ok {
 		t.Fatalf("want GROUP_MANIFEST, got %T", gm)
 	}
-	if len(manifest.Entries) != 1 {
-		t.Fatalf("want exactly the one readable file in the manifest (the blocked subtree must never reach it), got %d entries", len(manifest.Entries))
+	// The walker still emits the unreadable "blocked" directory itself (its
+	// entry, not its contents) plus the one readable file; only the file
+	// inside "blocked" (b.txt) is the walk-skip this test is about, and it
+	// must never show up here.
+	if len(manifest.Entries) != 2 {
+		t.Fatalf("want the readable file plus the blocked directory's own entry (not its unreadable contents), got %d entries", len(manifest.Entries))
 	}
-	entry := manifest.Entries[0]
+	var fileIdx uint16 = 255
+	var fileID uint64
+	for i, e := range manifest.Entries {
+		const entryTypeFile = 0
+		if e.EntryType == entryTypeFile {
+			fileIdx = uint16(i)
+			fileID = manifest.FirstFileID + uint64(i)
+		}
+	}
+	if fileIdx == 255 {
+		t.Fatalf("no file entry found in manifest: %+v", manifest.Entries)
+	}
 
-	if err := ctrl.SendMsg(&wire.GroupDecision{GroupID: manifest.GroupID, Accepted: []uint64{entry.FileID}}); err != nil {
+	if err := ctrl.SendMsg(&wire.GroupDecision{GroupID: manifest.GroupID, Needed: []uint16{fileIdx}}); err != nil {
 		t.Fatalf("send GROUP_DECISION: %v", err)
 	}
-	if err := ctrl.SendMsg(&wire.Credit{Amount: 4}); err != nil {
+	if err := ctrl.SendMsg(&wire.Credit{AdditionalGroups: 4}); err != nil {
 		t.Fatalf("send CREDIT: %v", err)
 	}
-	if err := dc.SendMsg(&wire.FileRequest{FileID: entry.FileID, Offset: 0}); err != nil {
+	if err := dc.SendMsg(&wire.FileRequest{RequestID: 1, FileID: fileID, Offset: 0, MaxChunk: 1 << 16}); err != nil {
 		t.Fatalf("send FILE_REQUEST: %v", err)
 	}
 
@@ -429,7 +448,7 @@ fileDone:
 	if !ok {
 		t.Fatalf("want SESSION_SUMMARY, got %T", ssm)
 	}
-	if err := ctrl.SendMsg(&wire.SessionSummaryAck{}); err != nil {
+	if err := ctrl.SendMsg(&wire.SessionSummaryAck{CompletionDigest: summary.CompletionDigest}); err != nil {
 		t.Fatalf("send SESSION_SUMMARY_ACK: %v", err)
 	}
 
@@ -441,7 +460,9 @@ fileDone:
 	}
 
 	if res.exit != 1 || res.sum.Outcome != "partial" {
-		t.Fatalf("exit = %d outcome = %q, want exit 1 outcome \"partial\": an unreadable subtree the walker warned-and-skipped must still fail the exit code (REQ-SCAN-032)", res.exit, res.sum.Outcome)
+		flush()
+		logged, _ := os.ReadFile(logPath)
+		t.Fatalf("exit = %d outcome = %q, want exit 1 outcome \"partial\": an unreadable subtree the walker warned-and-skipped must still fail the exit code (REQ-SCAN-032); log:\n%s", res.exit, res.sum.Outcome, logged)
 	}
 	if res.sum.FilesFailed != 0 {
 		t.Fatalf("FilesFailed = %d, want 0: this run's partial exit must come from the walk-skip, not from a receiver-reported failure (that would prove nothing about R-23)", res.sum.FilesFailed)
