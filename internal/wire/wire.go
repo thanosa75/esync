@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"esync/internal/crypto/record"
 	"esync/internal/fault"
 )
 
@@ -41,7 +42,62 @@ const (
 	maxIndexList  = 1024 // needed_count / rejected_count within one group
 	maxChunkData  = 1 << 20
 	maxBlob       = 4096 // nonce / tag / digest carried as a bytes field
+
+	// ManifestEntryFixedBytes is the wire cost of a ManifestEntry's fixed-width
+	// fields, i.e. everything encodeManifestEntry writes except Path, Digest,
+	// LinkTarget and HardlinkKey: EntryType(1) + Flags(2) + Path length-prefix(2)
+	// + Size(8) + Mode(4) + MtimeSec(8) + MtimeNsec(4) + digest length-prefix(1).
+	ManifestEntryFixedBytes = 1 + 2 + 2 + 8 + 4 + 8 + 4 + 1
+	// ManifestEntryLinkTargetPrefix is the length-prefix cost of the optional
+	// LinkTarget blob (present only when EntryType is symlink, §9.3).
+	ManifestEntryLinkTargetPrefix = 2
+	// ManifestEntryHardlinkKeyBytes is the cost of the optional HardlinkKey
+	// field (present only when ManifestFlagHasHardlinkKey is set).
+	ManifestEntryHardlinkKeyBytes = 8
+	// MaxDigestBytes is the wire ceiling on a ManifestEntry digest: the largest
+	// value any hash algorithm may ever produce on this wire (the u8 length
+	// prefix could in principle carry up to 255, but §9.3 declares this the
+	// protocol maximum).
+	MaxDigestBytes = maxDigest
+	// GroupManifestFixedBytes is the wire cost of a GROUP_MANIFEST's fixed
+	// fields, i.e. everything but the entries themselves: GroupID(4) +
+	// FirstFileID(8) + entry_count(2).
+	GroupManifestFixedBytes = 4 + 8 + 2
+
+	// manifestSafetyMargin is subtracted from the control-channel record
+	// ceiling when deriving MaxGroupManifestEntryBytes, leaving headroom for
+	// future GROUP_MANIFEST field growth beyond the worst-case PKCS#7 padding
+	// (already accounted for via record.PadBlockSize).
+	manifestSafetyMargin = 4096
+
+	// MaxGroupManifestFrameBytes is the largest a GROUP_MANIFEST frame (frame
+	// header + body) may be while still guaranteeing its control-record ct_len
+	// stays under record.MaxCTControl after AES-CBC padding, with
+	// manifestSafetyMargin bytes to spare.
+	MaxGroupManifestFrameBytes = record.MaxCTControl - record.PadBlockSize - manifestSafetyMargin
+	// MaxGroupManifestEntryBytes is the total encoded-entry byte budget
+	// available to one GROUP_MANIFEST: MaxGroupManifestFrameBytes minus the
+	// frame header and the message's own fixed fields. plan.Build's grouping
+	// keeps a group's summed ManifestEntrySize under this so no group can ever
+	// produce a control record the record layer rejects (R-13).
+	MaxGroupManifestEntryBytes = MaxGroupManifestFrameBytes - FrameHeaderLen - GroupManifestFixedBytes
 )
+
+// ManifestEntrySize returns the exact encoded wire size of a ManifestEntry
+// given its path length, a digest length (the caller decides how
+// conservative to be — the real digest is not always known yet), and its
+// optional fields. It mirrors encodeManifestEntry field-for-field so callers
+// (plan's group packing) never have to guess the layout.
+func ManifestEntrySize(pathLen, digestLen int, isSymlink bool, linkTargetLen int, hasHardlinkKey bool) int {
+	n := ManifestEntryFixedBytes + pathLen + digestLen
+	if isSymlink {
+		n += ManifestEntryLinkTargetPrefix + linkTargetLen
+	}
+	if hasHardlinkKey {
+		n += ManifestEntryHardlinkKeyBytes
+	}
+	return n
+}
 
 // errTrunc is the internal sentinel a reader raises when the buffer runs out or a
 // declared bound is exceeded. It never escapes the package: callers convert it to

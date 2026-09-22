@@ -41,8 +41,18 @@ const (
 	// MaxCTData is the ct_len ceiling on a data channel: 1 MiB of plaintext plus
 	// one PKCS#7 padding block.
 	MaxCTData = 1<<20 + blockSize
-	// MaxCTControl is the ct_len ceiling on control channel 0: 256 KiB plus a pad block.
-	MaxCTControl = 1<<18 + blockSize
+	// MaxCTControl is the ct_len ceiling on control channel 0: 512 KiB plus a pad
+	// block (raised from 256 KiB, R-13: a 1024-entry GROUP_MANIFEST with
+	// long paths could exceed the old ceiling and fail deterministically).
+	// Sender and receiver MUST agree on this value — it is consumed only via
+	// maxCT() below, and internal/wire derives its group-manifest packing
+	// budget (MaxGroupManifestEntryBytes) from it, so there is one source of
+	// truth for both sides of the wire.
+	MaxCTControl = 1<<19 + blockSize
+	// PadBlockSize is the AES block size records pad to. Exported so callers
+	// that must reason about worst-case PKCS#7 padding (e.g. plan's group
+	// packing, R-13) don't duplicate the value.
+	PadBlockSize = blockSize
 )
 
 func maxCT(channelID uint8) int {

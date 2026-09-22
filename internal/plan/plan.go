@@ -14,6 +14,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
+
+	"esync/internal/wire"
 )
 
 // Type is the kind of a plan entry. Directories and symlinks occupy file ids and
@@ -218,30 +220,65 @@ func groupTarget(n int64) int64 {
 	return n
 }
 
+// maxGroupManifestEntryBytes is the total encoded GROUP_MANIFEST entry-byte
+// budget for one group (wire.MaxGroupManifestEntryBytes, R-13): keeping a
+// group's summed manifestEntrySize under this guarantees its GROUP_MANIFEST
+// control record can never exceed record.MaxCTControl, regardless of how many
+// entries or how long their paths are.
+var maxGroupManifestEntryBytes = int64(wire.MaxGroupManifestEntryBytes)
+
+// manifestEntrySize is a conservative estimate of the wire-encoded size of e
+// as a GROUP_MANIFEST ManifestEntry (mirrors internal/wire's
+// encodeManifestEntry). The digest is not known at grouping time (it is
+// hashed lazily, only once a group is credited — see sender/manifest.go), so
+// for a regular file this assumes the wire's maximum possible digest length
+// (wire.MaxDigestBytes); that can only overestimate, never underestimate, the
+// real encoded size. LinkTarget and HardlinkKey are already known exactly at
+// this point, so those use their real lengths.
+func manifestEntrySize(e *Entry) int {
+	digestLen := 0
+	if e.Type == TypeFile {
+		digestLen = wire.MaxDigestBytes
+	}
+	linkLen := 0
+	isSymlink := e.Type == TypeSymlink
+	if isSymlink {
+		linkLen = len(e.LinkTarget)
+	}
+	hasHardlink := e.Flags&FlagHasHardlinkKey != 0
+	return wire.ManifestEntrySize(len(e.RelPath), digestLen, isSymlink, linkLen, hasHardlink)
+}
+
 // computeGroups returns the ascending start index of each group followed by a
 // trailing len(entries) sentinel, so group i spans entries[start[i]:start[i+1]]
 // (§10.4). A group is closed before an entry once it already holds
-// maxGroupEntries entries or once adding that entry's file bytes would take the
-// group past target — so a single oversize file forms its own group. Only
-// regular-file sizes count toward the byte target; dirs and symlinks still take
-// an id slot but contribute nothing. An empty plan has no groups.
+// maxGroupEntries entries, once adding that entry's file bytes would take the
+// group past target, or once adding that entry's encoded manifest size would
+// take the group's GROUP_MANIFEST past maxGroupManifestEntryBytes (R-13) — so
+// a single oversize file, or a single entry whose path alone would blow the
+// manifest budget, forms its own group. Only regular-file sizes count toward
+// the byte target; dirs and symlinks still take an id slot but contribute
+// nothing. An empty plan has no groups.
 func computeGroups(entries []Entry, target int64) []int {
 	if len(entries) == 0 {
 		return []int{0}
 	}
 	starts := []int{0}
 	var acc int64
+	var manifestAcc int64
 	count := 0
 	for i := range entries {
 		var sz int64
 		if entries[i].Type == TypeFile {
 			sz = entries[i].Size
 		}
-		if count > 0 && (count >= maxGroupEntries || acc+sz > target) {
+		mSize := int64(manifestEntrySize(&entries[i]))
+		if count > 0 && (count >= maxGroupEntries || acc+sz > target || manifestAcc+mSize > maxGroupManifestEntryBytes) {
 			starts = append(starts, i)
-			acc, count = 0, 0
+			acc, manifestAcc, count = 0, 0, 0
 		}
 		acc += sz
+		manifestAcc += mSize
 		count++
 	}
 	return append(starts, len(entries))

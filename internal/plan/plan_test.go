@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
+
+	"esync/internal/crypto/record"
+	"esync/internal/obs"
+	"esync/internal/wire"
 )
 
 func fileEntry(p string, size int64, mtime int64) Entry {
@@ -201,6 +206,101 @@ func TestTotals(t *testing.T) {
 	}
 	if len(p.Entries()) != 4 {
 		t.Fatalf("entries = %d, want 4", len(p.Entries()))
+	}
+}
+
+// R-13 / T-SCAN-02: a 1024-entry group with long paths would encode a
+// GROUP_MANIFEST bigger than record.MaxCTControl if grouping only capped entry
+// count and file bytes. The manifest-size cap must split it into more groups,
+// each of which stays within wire.MaxGroupManifestEntryBytes.
+func TestGroupingByManifestSize(t *testing.T) {
+	const n = 1024
+	longName := strings.Repeat("x", 450)
+	var es []Entry
+	for i := 0; i < n; i++ {
+		es = append(es, fileEntry(fmt.Sprintf("d/%s/%04d", longName, i), 10, 1))
+	}
+	p := mustBuild(t, es)
+	if p.NumGroups() <= 1 {
+		t.Fatalf("NumGroups = %d, want > 1 (manifest-size cap should have split this group)", p.NumGroups())
+	}
+
+	total := 0
+	for gi := 0; gi < p.NumGroups(); gi++ {
+		group := p.Group(gi)
+		if len(group) == 0 {
+			t.Fatalf("group %d is empty", gi)
+		}
+		total += len(group)
+		var sum int64
+		for i := range group {
+			sum += int64(manifestEntrySize(&group[i]))
+		}
+		if sum > maxGroupManifestEntryBytes {
+			t.Fatalf("group %d encoded manifest bytes = %d, want <= %d", gi, sum, maxGroupManifestEntryBytes)
+		}
+	}
+	if total != n {
+		t.Fatalf("total entries across groups = %d, want %d", total, n)
+	}
+}
+
+// R-13: a single entry whose own encoded size already exceeds
+// maxGroupManifestEntryBytes must still get its own one-entry group — not an
+// infinite loop, not a zero-entry group, and it must not swallow the next
+// entry into the same (already oversize) group.
+func TestGroupingByManifestSizeSingleOversizeEntry(t *testing.T) {
+	huge := strings.Repeat("x", 600_000) // encoded size alone exceeds the budget
+	es := []Entry{
+		fileEntry(huge, 10, 1),
+		fileEntry("small", 5, 1),
+	}
+	p := mustBuild(t, es)
+	if p.NumGroups() != 2 {
+		t.Fatalf("NumGroups = %d, want 2 (oversize entry isolated into its own group)", p.NumGroups())
+	}
+	if len(p.Group(0)) != 1 || len(p.Group(1)) != 1 {
+		t.Fatalf("group sizes = %d/%d, want 1/1", len(p.Group(0)), len(p.Group(1)))
+	}
+}
+
+// R-13: the largest group the real packing algorithm forms out of
+// maximum-length (wire.maxPathBytes) paths, encoded exactly as
+// sender/manifest.go would (worst-case max-length digests filled in), must
+// still fit inside one control-channel record.
+func TestRealisticWorstCaseGroupFitsControlRecord(t *testing.T) {
+	pathPrefix := strings.Repeat("p", 4090) // + "/dddd" = 4095 bytes, under the wire's 4096 cap
+	var es []Entry
+	for i := 0; i < maxGroupEntries; i++ {
+		es = append(es, fileEntry(fmt.Sprintf("%s/%04d", pathPrefix, i), 10, 1))
+	}
+	p := mustBuild(t, es)
+
+	group := p.Group(0)
+	if len(group) == 0 || len(group) >= maxGroupEntries {
+		t.Fatalf("group 0 size = %d, want a manifest-size-capped group well under %d", len(group), maxGroupEntries)
+	}
+	gm := &wire.GroupManifest{GroupID: 0, FirstFileID: 0, Entries: make([]wire.ManifestEntry, len(group))}
+	for i, e := range group {
+		gm.Entries[i] = wire.ManifestEntry{
+			EntryType: uint8(e.Type),
+			Path:      e.RelPath,
+			Size:      uint64(e.Size),
+			MtimeSec:  e.MtimeSec,
+			Digest:    bytes.Repeat([]byte{0xAB}, wire.MaxDigestBytes),
+		}
+	}
+	body, err := wire.Marshal(gm)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	kEnc := obs.NewSecret(bytes.Repeat([]byte{0x01}, 32))
+	kMac := obs.NewSecret(bytes.Repeat([]byte{0x02}, 32))
+	var buf bytes.Buffer
+	w := record.NewWriter(&buf, kEnc, kMac, 0)
+	if err := w.WriteFrame(body); err != nil {
+		t.Fatalf("worst-case group manifest exceeds the control-record ceiling: %v", err)
 	}
 }
 
