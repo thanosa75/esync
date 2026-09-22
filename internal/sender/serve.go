@@ -113,6 +113,24 @@ func (s *servicer) serve(ctx context.Context, req *wire.FileRequest) (retErr err
 		end("error")
 		return nil
 	}
+	// serve() reopens by path, so anything swapped in since the scan — a symlink
+	// pointing outside the root, or a different file — would be streamed to the
+	// peer in full: the manifest-digest check at the end of this function only
+	// fires once the bytes are already on the wire. Verify identity on the open
+	// fd first. (Dev/Ino are zero on platforms without stat support, where there
+	// is nothing to compare against.)
+	if !fi.Mode().IsRegular() {
+		_ = s.sendErr(req, fault.E6003, false, "source is no longer a regular file")
+		s.tr.reqFailed(req.RequestID, true, true)
+		end("error", obs.F("code", string(fault.E6003)))
+		return nil
+	}
+	if dev, ino, _ := sysStat(fi); e.Ino != 0 && (dev != e.Dev || ino != e.Ino) {
+		_ = s.sendErr(req, fault.E6003, false, "source file identity changed since scan")
+		s.tr.reqFailed(req.RequestID, true, true)
+		end("error", obs.F("code", string(fault.E6003)))
+		return nil
+	}
 	if uint64(fi.Size()) != uint64(e.Size) {
 		_ = s.sendErr(req, fault.E6003, false, "source size changed since scan")
 		s.tr.reqFailed(req.RequestID, true, true)

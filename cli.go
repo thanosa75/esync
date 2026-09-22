@@ -254,6 +254,26 @@ func once(f func()) func() {
 // ---------------------------------------------------------------------------
 
 func runSender(args []string) int {
+	cfg, c, lvl, code := senderConfig(args)
+	if code != 0 {
+		return code
+	}
+
+	ctx, flushRaw := obs.Init(c.obsConfig("sender", lvl))
+	flush := once(flushRaw)
+	defer flush()
+	installFatalHandler(ctx, flush)
+	installSignalEscape(ctx, *c.shutdownGrace, flush)
+
+	_, code = sender.Run(ctx, cfg)
+	return code
+}
+
+// senderConfig parses and validates the sender flag set and resolves the final
+// sender.Config. It opens nothing and starts nothing, so tests can assert on a
+// fully resolved Config without a live transfer. A non-zero int is a usage exit
+// code the caller returns unchanged; the other results are then meaningless.
+func senderConfig(args []string) (sender.Config, *commonFlags, obs.Level, int) {
 	fs := flag.NewFlagSet("esync", flag.ContinueOnError)
 	var help bytes.Buffer
 	fs.SetOutput(&help)
@@ -271,6 +291,8 @@ func runSender(args []string) int {
 	readConcurrency := fs.Int("read-concurrency", 4, "concurrent file reads per channel")
 	groupBytes := fs.Int64("group-bytes", 512<<20, "target manifest group size in bytes")
 	_ = fs.Int("spill-threshold", 500_000, "external-sort spill threshold (parsed; in-memory sort in this build)")
+	drainTimeout := fs.Duration("drain-timeout", 60*time.Second, "post-transfer drain watchdog")
+	compactCode := fs.Bool("compact-code", false, "truncate the pairing code to two endpoints")
 
 	var filters []plan.FilterRule
 	fs.Var(filterFlag{&filters, true}, "include", "include glob (repeatable)")
@@ -278,28 +300,28 @@ func runSender(args []string) int {
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprint(os.Stderr, help.String())
-		return usageErr(err)
+		return sender.Config{}, nil, 0, usageErr(err)
 	}
 	if err := applyEnv(fs); err != nil {
-		return usageErr(err)
+		return sender.Config{}, nil, 0, usageErr(err)
 	}
 
 	rest := fs.Args()
 	switch len(rest) {
 	case 0:
-		return usageErr(fmt.Errorf("a source path is required"))
+		return sender.Config{}, nil, 0, usageErr(fmt.Errorf("a source path is required"))
 	case 1:
 	default:
-		return usageErr(fmt.Errorf("exactly one source path is expected, got %d", len(rest)))
+		return sender.Config{}, nil, 0, usageErr(fmt.Errorf("exactly one source path is expected, got %d", len(rest)))
 	}
 
 	lvl, err := c.resolveLevel()
 	if err != nil {
-		return usageErr(err)
+		return sender.Config{}, nil, 0, usageErr(err)
 	}
 	hashAlg, err := parseHash(*c.hash)
 	if err != nil {
-		return usageErr(err)
+		return sender.Config{}, nil, 0, usageErr(err)
 	}
 	for _, e := range []error{
 		atLeast("log-ring", *c.logRing, 1),
@@ -313,15 +335,9 @@ func runSender(args []string) int {
 		atLeast("group-bytes", int(*groupBytes), 1<<20),
 	} {
 		if e != nil {
-			return usageErr(e)
+			return sender.Config{}, nil, 0, usageErr(e)
 		}
 	}
-
-	ctx, flushRaw := obs.Init(c.obsConfig("sender", lvl))
-	flush := once(flushRaw)
-	defer flush()
-	installFatalHandler(ctx, flush)
-	installSignalEscape(ctx, *c.shutdownGrace, flush)
 
 	cfg := sender.Config{
 		SourcePath:       rest[0],
@@ -332,7 +348,7 @@ func runSender(args []string) int {
 		PairTimeout:      *pairTimeout,
 		MaxPairAttempts:  *maxPairAttempts,
 		HandshakeTimeout: *c.handshakeTimeout,
-		DrainTimeout:     60 * time.Second,
+		DrainTimeout:     *drainTimeout,
 		ProgressInterval: *c.progressInterval,
 		GroupBytes:       *groupBytes,
 		HashAlg:          hashAlg,
@@ -346,11 +362,11 @@ func runSender(args []string) int {
 		KeepSystemFiles:  *keepSystemFiles,
 		Quick:            *c.quick,
 		NoCache:          *c.noCache,
+		CompactCode:      *compactCode,
 		Filters:          filters,
 	}
 
-	_, code := sender.Run(ctx, cfg)
-	return code
+	return cfg, c, lvl, 0
 }
 
 // ---------------------------------------------------------------------------

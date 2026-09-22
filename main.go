@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+
+	"esync/internal/wire"
 )
 
 // Stamped by the linker via -ldflags (see Makefile).
@@ -32,8 +34,8 @@ func run(args []string) int {
 			printUsage(os.Stdout)
 			return 0
 		case "--version", "-version":
-			fmt.Printf("esync %s (commit %s, built %s, %s/%s)\n",
-				version, commit, date, runtime.GOOS, runtime.GOARCH)
+			fmt.Printf("esync %s (commit %s, built %s, protocol %d, %s/%s)\n",
+				version, commit, date, wire.ProtocolVersion, runtime.GOOS, runtime.GOARCH)
 			return 0
 		}
 		if a == "--" {
@@ -94,6 +96,8 @@ sender flags (ARCHITECTURE §16.2):
   --exclude <glob>        (repeatable)
   --hash-workers <n>      default min(8, NumCPU)
   --read-concurrency <n>  default 4
+  --drain-timeout <d>     post-transfer drain watchdog (default 60s)
+  --compact-code          truncate the pairing code to two endpoints
 
 receiver flags (ARCHITECTURE §16.3):
   --link <code>           pairing code (required)

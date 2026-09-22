@@ -349,3 +349,48 @@ func TestCreditGateBlocksAndReleases(t *testing.T) {
 		t.Fatal("acquire on cancelled context should fail")
 	}
 }
+
+// R-26: serve() reopens by path, so a path swapped between the scan and the
+// request must be caught on the open fd. A symlink to an outside file of the
+// same size passes the size check, and the manifest-digest check only fires
+// once the content is already on the wire — so identity has to be verified
+// before the first chunk is sent.
+func TestServeRejectsSwappedFileIdentity(t *testing.T) {
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret")
+	writeFile(t, secret, []byte("SECRET-OUTSIDE-THE-ROOT!"))
+
+	root := t.TempDir()
+	p := filepath.Join(root, "f.bin")
+	writeFile(t, p, []byte("harmless scanned content"))
+	if len([]byte("SECRET-OUTSIDE-THE-ROOT!")) != len([]byte("harmless scanned content")) {
+		t.Fatal("test setup: the swapped file must have the scanned size")
+	}
+	pl := buildPlan(t, root)
+	fid, ok := pl.FileID("f.bin")
+	if !ok {
+		t.Fatal("file_id not found")
+	}
+
+	// The swap: same path, same size, different inode — and it escapes the root.
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, p); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := newTracker([]uint64{0})
+	s, rx := newServicer(t, root, pl, newDigestStore(), tr)
+	go func() { _ = s.run(context.Background()) }()
+
+	rx.send(&wire.FileRequest{RequestID: 1, FileID: fid})
+	m := rx.recv()
+	fe, ok := m.(*wire.FileError)
+	if !ok {
+		t.Fatalf("want FILE_ERROR before any content, got %T", m)
+	}
+	if fe.Code != codeNum(fault.E6003) || fe.Retryable != 0 {
+		t.Fatalf("bad error: code=%d retryable=%d", fe.Code, fe.Retryable)
+	}
+}

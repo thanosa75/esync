@@ -35,6 +35,10 @@ type Config struct {
 	ChunkSize       int
 	SocketBuffer    int
 
+	// CompactCode (--compact-code, §16.2/§5.2) caps the pairing code at two
+	// endpoints so it stays inside the REQ-PAIR-002 64-character target.
+	CompactCode bool
+
 	FollowSymlinks  bool
 	OneFileSystem   bool
 	Hardlinks       bool

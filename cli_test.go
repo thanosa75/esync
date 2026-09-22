@@ -2,14 +2,18 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"esync/internal/digest"
 	"esync/internal/fault"
 	"esync/internal/obs"
+	"esync/internal/sender"
+	"esync/internal/wire"
 )
 
 // quietStd redirects stdout+stderr to a drain for the duration of a test so the
@@ -225,5 +229,57 @@ func TestSignalEscapeNoSignal(t *testing.T) {
 	case <-got:
 		t.Fatal("exit called with no signal delivered")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// captureSenderConfig resolves the sender flag set exactly as runSender does
+// and returns the resulting Config (R-12, R-19). senderConfig parses and
+// validates only — it opens no listener and starts no transfer — so this needs
+// no seam in production code and no live peer.
+func captureSenderConfig(t *testing.T, args ...string) sender.Config {
+	t.Helper()
+	quietStd(t)
+	cfg, _, _, code := senderConfig(append(args, "/some/source"))
+	if code != 0 {
+		t.Fatalf("senderConfig(%q) returned usage exit %d, want 0", args, code)
+	}
+	return cfg
+}
+
+// TestRunSenderDrainTimeout: --drain-timeout must reach sender.Config.DrainTimeout
+// (R-12) rather than being hardcoded, so the sender's E9002 watchdog is tunable.
+func TestRunSenderDrainTimeout(t *testing.T) {
+	cfg := captureSenderConfig(t, "--drain-timeout", "3m")
+	if cfg.DrainTimeout != 3*time.Minute {
+		t.Errorf("DrainTimeout = %v, want 3m", cfg.DrainTimeout)
+	}
+}
+
+// TestRunSenderCompactCode: --compact-code must reach sender.Config.CompactCode
+// (R-19 CLI half).
+func TestRunSenderCompactCode(t *testing.T) {
+	if cfg := captureSenderConfig(t); cfg.CompactCode {
+		t.Fatal("CompactCode = true without --compact-code")
+	}
+	cfg := captureSenderConfig(t, "--compact-code")
+	if !cfg.CompactCode {
+		t.Error("CompactCode = false, want true from --compact-code")
+	}
+}
+
+// TestVersionIncludesProtocol: --version must report the wire protocol version
+// (R-22 / REQ-CLI-008), not just semver/commit/date.
+func TestVersionIncludesProtocol(t *testing.T) {
+	orig := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	run([]string{"--version"})
+	w.Close()
+	os.Stdout = orig
+
+	out, _ := io.ReadAll(r)
+	want := fmt.Sprintf("protocol %d", wire.ProtocolVersion)
+	if !strings.Contains(string(out), want) {
+		t.Errorf("--version output = %q, want it to contain %q", out, want)
 	}
 }

@@ -45,6 +45,12 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	// clean shutdown.
 	var ctrl *channel.Conn
 	var errNotified bool
+	// walkSkipped is set once the walker finishes (step 9); finish reads it here
+	// (rather than through Summary, whose FilesSkipped already means something
+	// else — see R-23) so an unreadable subtree the walker warned-and-skipped
+	// (E6005/E6006/E6007) still yields a non-zero exit even though it never
+	// reached the receiver and so never became a FilesFailed count.
+	var walkSkipped uint32
 	finish := func(sum Summary) (Summary, int) {
 		var ferr error
 		if v := fatal.Load(); v != nil {
@@ -65,7 +71,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 				})
 			}
 			obs.LogFault(ctx, ferr)
-		case sum.FilesFailed > 0:
+		case sum.FilesFailed > 0 || walkSkipped > 0:
 			exit, outcome = 1, "partial"
 		}
 		sum.Elapsed = time.Since(start)
@@ -129,6 +135,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	if len(eps) > 4 {
 		eps = eps[:4]
 	}
+	eps = compactEndpoints(ctx, eps, cfg.CompactCode)
 
 	// --- 5. print the pairing code (stdout: the code only) ---------------
 	code := paircode.Encode(&paircode.Payload{Endpoints: eps, Secret: secret, Restricted: cfg.Bind != ""})
@@ -205,7 +212,6 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 
 	// --- 9. scan / hash / manifest / serve ---------------------------
 	entriesCh := make(chan plan.Entry, 4096)
-	var walkSkipped uint32
 	var walkErr error
 	scanEnd := obs.Start(ctx, "scan")
 	obs.Go(octx, "walker", func() error {
@@ -274,6 +280,15 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 				case ackc <- v:
 				default:
 				}
+			case *wire.Error:
+				// The receiver hit a fatal (E7003 disk full, E3005 stall, E5006
+				// protocol, ...) and is telling us before it exits (ARCHITECTURE
+				// §14.4 / REQ-ERR-005: "both sides log the same cause"). Without
+				// this the reader falls through to a bare EOF on the receiver's
+				// close and treats a receiver death as a clean end of session.
+				setFatal(peerError(v))
+				cancel()
+				return nil
 			default:
 				setFatal(fault.Newf(fault.E5001, "control.reader", m.Type().String(), nil, "unexpected control message"))
 				cancel()
@@ -396,10 +411,16 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 
 	comp := tr.completionDigest()
 	transferred, skipped, failed, bytesSent := tr.counts()
+	// R-23: fold the walker's warn-and-skip count (E6005/E6006/E6007, entries
+	// the sender itself could not read and so never offered to the receiver)
+	// into FilesSkipped alongside receiver-driven skips + excluded entries.
+	// wire.SessionSummary has no separate field for this and internal/wire is
+	// outside this fix's ownership, so the two are conflated here rather than
+	// left to silently vanish (REQ-SCAN-032).
 	sum := &wire.SessionSummary{
 		FilesTotal:       pl.TotalFiles,
 		FilesTransferred: transferred,
-		FilesSkipped:     skipped + uint64(pl.ExcludedCount),
+		FilesSkipped:     skipped + uint64(pl.ExcludedCount) + uint64(walkSkipped),
 		FilesFailed:      failed,
 		BytesTransferred: bytesSent,
 		GroupsTotal:      uint32(pl.NumGroups()),
@@ -493,12 +514,19 @@ func acceptData(ctx obs.Ctx, lst *channel.Listener, sess *handshake.Session, n i
 		if err != nil {
 			return nil, fault.Wrap(fault.E4002, "accept data channel", "", err)
 		}
+		// REQ-NET-010: no code path may wait forever. The listener deadline above
+		// bounds Accept, not the CHANNEL_JOIN read that follows it — without this
+		// any host on the LAN can connect, stay silent, and park AcceptChannel's
+		// io.ReadFull on a still-unauthenticated conn, stalling the accept loop for
+		// the rest of the session. Mirrors the receiver's dialOneData.
+		_ = nc.SetDeadline(time.Now().Add(cfg.HandshakeTimeout))
 		id, jerr := handshake.AcceptChannel(ctx, nc, sess, uint8(n))
 		if jerr != nil {
 			_ = nc.Close()
 			obs.Warn(ctx, "channel join rejected", obs.F("cause", jerr))
 			continue
 		}
+		_ = nc.SetDeadline(time.Time{})
 		conns = append(conns, channel.Data(nc, id, sess, channel.Sender, cfg.SocketBuffer))
 	}
 	return conns, nil
@@ -518,6 +546,41 @@ func sessionParams(cfg Config, absRoot string, sourceKind uint8) *wire.SessionPa
 		FilterSignature: cfg.planOptions().FilterSignature(),
 		SysexcludeTag:   sysexcludeTag(cfg),
 	}
+}
+
+// compactEndpoints applies --compact-code (R-19, §16.2/§5.2) and the §14.1
+// warning: with compact set, the code is capped at two endpoints so it stays
+// inside the REQ-PAIR-002 64-character budget; either way, a code still
+// carrying more than two endpoints gets a stderr WARN (obs — stdout carries
+// only the pairing code itself, REQ-CLI-005) rather than growing silently.
+// Pulled out of Run so the truncate/warn decision can be tested directly
+// against a synthetic endpoint list, without depending on this host's real
+// network interfaces via paircode.Discover.
+func compactEndpoints(ctx obs.Ctx, eps []paircode.Endpoint, compact bool) []paircode.Endpoint {
+	if compact && len(eps) > 2 {
+		eps = eps[:2]
+	}
+	if len(eps) > 2 {
+		obs.Warn(ctx, "pairing code carries more than two endpoints, consider --compact-code",
+			obs.F("endpoints", len(eps)))
+	}
+	return eps
+}
+
+// peerError converts an inbound *wire.Error from the receiver (its fatal
+// notification, mirroring this side's own send in finish) into a *fault.Fault
+// carrying the receiver's E-code, so the sender's exit code and logged cause
+// match what the receiver reported instead of a bare "clean EOF".
+func peerError(e *wire.Error) error {
+	code := fault.Code(fmt.Sprintf("E%04d", e.Code))
+	msg := e.Message
+	if msg == "" {
+		msg = "receiver reported a fatal error"
+	}
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	return fault.Newf(code, "receiver reported an error", "", nil, "%s", msg)
 }
 
 func sysexcludeTag(cfg Config) string {
