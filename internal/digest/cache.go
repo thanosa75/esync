@@ -25,13 +25,18 @@ import (
 // A short or crc-mismatched trailing record is discarded on read.
 
 const (
-	cacheMagic = "esync digest cache v1\n"
-	keyLen     = 8 + 8 + 8 + 8 + 8 + 8 + 1 // dev,ino,size,mtime_sec,mtime_nsec,ctime_sec,algo
+	cacheMagic = "esync digest cache v2\n"     // v2 added ctime_nsec to the key
+	keyLen     = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 1 // dev,ino,size,mtime_sec,mtime_nsec,ctime_sec,ctime_nsec,algo
 	maxDigest  = 32
 )
 
 // CacheKey identifies a file version for the digest cache (ARCHITECTURE §11.3).
-// ctime is included so an in-place modification that preserves mtime still misses.
+// ctime is included so an in-place modification that preserves mtime still
+// misses — at FULL timespec resolution: with only ctime_sec, a rewrite landing
+// in the same wall-clock second as the previous ctime, with the size and mtime
+// restored (rsync, tar, git checkout, any generated file), is a stale HIT and
+// the receiver silently skips a file that changed. The cache is advisory for
+// speed but authoritative for that skip decision, so the key must be exact.
 type CacheKey struct {
 	Dev       uint64
 	Ino       uint64
@@ -39,6 +44,7 @@ type CacheKey struct {
 	MtimeSec  int64
 	MtimeNsec int64
 	CtimeSec  int64
+	CtimeNsec int64
 	Algo      Algo
 }
 
@@ -196,6 +202,7 @@ func appendKey(b []byte, k CacheKey) []byte {
 	b = binary.BigEndian.AppendUint64(b, uint64(k.MtimeSec))
 	b = binary.BigEndian.AppendUint64(b, uint64(k.MtimeNsec))
 	b = binary.BigEndian.AppendUint64(b, uint64(k.CtimeSec))
+	b = binary.BigEndian.AppendUint64(b, uint64(k.CtimeNsec))
 	return append(b, byte(k.Algo))
 }
 
@@ -207,7 +214,8 @@ func decodeKey(b []byte) CacheKey {
 		MtimeSec:  int64(binary.BigEndian.Uint64(b[24:32])),
 		MtimeNsec: int64(binary.BigEndian.Uint64(b[32:40])),
 		CtimeSec:  int64(binary.BigEndian.Uint64(b[40:48])),
-		Algo:      Algo(b[48]),
+		CtimeNsec: int64(binary.BigEndian.Uint64(b[48:56])),
+		Algo:      Algo(b[56]),
 	}
 }
 

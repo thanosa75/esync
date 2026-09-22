@@ -22,6 +22,7 @@ func statKey(fi fs.FileInfo, algo Algo) (CacheKey, bool) {
 		MtimeSec:  int64(st.Mtim.Sec),
 		MtimeNsec: int64(st.Mtim.Nsec),
 		CtimeSec:  int64(st.Ctim.Sec),
+		CtimeNsec: int64(st.Ctim.Nsec),
 		Algo:      algo,
 	}, true
 }

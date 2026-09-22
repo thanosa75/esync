@@ -2,6 +2,7 @@ package digest
 
 import (
 	"bytes"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"os"
@@ -214,5 +215,75 @@ func TestMarshalRoundTrip(t *testing.T) {
 	}
 	if _, err := Unmarshal(SHA256, []byte("junk")); fault.GetCode(err) != fault.E8004 {
 		t.Fatalf("Unmarshal(junk) err = %v, want E8004", err)
+	}
+}
+
+// MFR-0015 (ARCHITECTURE §11.3 erratum): the cache key carries ctime at full
+// timespec resolution. Two versions of a file whose ctime differs only in the
+// nanosecond field must be distinct entries — otherwise an in-place rewrite
+// that preserves size and mtime and lands in the same wall-clock second is a
+// stale HIT, and the receiver silently skips a file that changed.
+func TestCacheKeyDistinguishesCtimeNsec(t *testing.T) {
+	c := OpenCache(obs.Ctx{}, filepath.Join(t.TempDir(), "cache.db"))
+	defer c.Close()
+
+	k1 := CacheKey{Dev: 1, Ino: 2, Size: 8, MtimeSec: 100, MtimeNsec: 5, CtimeSec: 100, CtimeNsec: 1, Algo: MD5}
+	k2 := k1
+	k2.CtimeNsec = 2
+
+	c.Put(k1, []byte("stale-digest-aa!"))
+	if got, hit := c.Get(k2); hit {
+		t.Fatalf("stale hit across a sub-second ctime change: %x", got)
+	}
+	if got, hit := c.Get(k1); !hit || string(got) != "stale-digest-aa!" {
+		t.Fatalf("own key missed: hit=%v got=%x", hit, got)
+	}
+
+	// The key must survive the on-disk codec intact, nsec included.
+	if round := decodeKey(appendKey(nil, k1)); round != k1 {
+		t.Fatalf("key round-trip = %+v, want %+v", round, k1)
+	}
+}
+
+// The realistic shape of the same defect: a tool rewrites a file in place,
+// keeps the size, and restores the mtime (rsync, tar, git checkout). The
+// digest must track the new content even when the rewrite lands in the same
+// second as the original.
+func TestCacheMissesOnMtimePreservingRewrite(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "gen.out")
+	if err := os.WriteFile(p, []byte("first-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := statKey(fi, MD5); !ok {
+		t.Skip("no platform stat")
+	}
+
+	c := OpenCache(obs.Ctx{}, filepath.Join(dir, "cache.db"))
+	defer c.Close()
+	if _, err := HashFile(obs.Ctx{}, p, MD5, c); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same size, same mtime, different bytes — immediately, so ctime_sec very
+	// likely still matches and only the nanoseconds separate the two versions.
+	if err := os.WriteFile(p, []byte("second-conten"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(p, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := HashFile(obs.Ctx{}, p, MD5, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := md5.Sum([]byte("second-conten"))
+	if !bytes.Equal(got, want[:]) {
+		t.Fatalf("stale digest after an mtime-preserving in-place rewrite: got %x, want %x", got, want)
 	}
 }
