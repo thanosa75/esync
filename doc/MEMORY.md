@@ -133,9 +133,118 @@ rejoins — and must drop the dead request WITHOUT resolving the file
 Only a stall (per-receive deadline, half-open sender), a coded channel/record
 fault, or the LAST channel retiring with work still queued is E3005 (R-24).
 
+MFR-0014 · receiver/fetch · An item-class error raised BETWEEN the FILE_HEADER and
+a terminal message (FILE_COMPLETE/FILE_ERROR) leaves the dead request's unread
+FILE_CHUNKs on the wire. The channel is desynced and MUST NOT serve another
+request: reusing it reads that tail as the next request's FILE_HEADER →
+E5001 "unexpected message" → session-fatal. So a transient E7004 destination
+write error — the one code the catalogue marks "retried" — currently cannot
+retry, it kills the session. Tag such errors (`desynced`, which WRAPS the cause
+so GetCode/IsFatal/IsRetryable still see it), give the item its normal fate
+(retry with backoff, or fail once the budget is spent), then end the worker and
+rejoin (§7.3 row 1). Do NOT reuse `channelLost` for this: it discards the
+attempt count, so a persistent local write failure would rejoin forever instead
+of failing. FILE_CANCEL cannot help — the receiver never sends it, and `serve()`
+runs synchronously inside `run()` so the sender cannot read it mid-stream.
+
+MFR-0015 · digest/cache · The digest cache key carries ctime at FULL timespec
+resolution (`CtimeSec` + `CtimeNsec`). Second granularity silently breaks the
+very guarantee ctime is there for: a rewrite preserving size and mtime that
+lands in the same wall-clock second as the previous ctime is a stale HIT and the
+receiver skips a file that changed. The cache is advisory for speed but
+authoritative for the skip decision, so the key must be exact. Any change to
+`CacheKey` or its codec must bump `cacheMagic` (now v2) so stale files are
+discarded by the existing version check.
+
+MFR-0011 · receiver/fetch loop · When a fetch ends because the worker's context
+was cancelled, REQUEUE the item — never `q.done()` it. The adaptive tuner's
+`retireOne` (§13.4) cancels one worker's ctx while the session keeps running, so
+"ctx cancelled" does NOT mean "session over": `done()` there retires a file that
+was never fetched (a silent hole in the destination on an otherwise exit-0 run),
+counts it toward `waitDrained`, and swallows a fatal that another worker would
+have reported. This holds at BOTH cancel sites — the post-`fetchOne` switch and
+the `<-ctx.Done()` arm of the retry backoff (there the attempt is consumed first,
+`it.attempt++`, because the retry was already decided and counted). Keep the
+`ctx.Err() != nil` case ahead of the error classification: on a real shutdown the
+conn closes and the resulting transport error would otherwise be reported as a
+spurious E3005 fatal on a clean Ctrl-C.
+
+MFR-0012 · sender/acceptData · A listener deadline bounds `Accept`, NOT the
+`CHANNEL_JOIN` read behind it. Always `SetDeadline(now+HandshakeTimeout)` on the
+accepted conn before `handshake.AcceptChannel` and clear it after — without it
+any host on the LAN can connect, stay silent, and park `io.ReadFull` on a
+still-unauthenticated socket for the rest of the session, stalling the accept
+loop (REQ-NET-010: no code path may wait forever). The receiver's `dialOneData`
+comment claiming the sender already bounds its accept window was wrong.
+
+MFR-0013 · sender/serve · `serve()` reopens the file BY PATH, long after the
+scan. Verify identity on the open fd (`Dev`/`Ino` from the plan entry, guarded by
+`e.Ino != 0` for platforms without stat support) plus `Mode().IsRegular()` BEFORE
+the first byte is sent. The end-of-stream manifest-digest check is not a
+substitute: it only fires once the content is already on the wire, so a symlink
+swapped in after the scan (same size, pointing outside the root) is exfiltrated
+in full and only then reported. Do NOT reach for `os.Root` here — `--follow-symlinks`
+walk mode legitimately serves content through symlinks that escape the root.
+
 ---
 
 ## Session Log
+
+### 2026-09-22 — bug-hunt tier 1: cancelled-worker data loss, unbounded join read, serve TOCTOU
+
+- 4-agent bug hunt (Sonnet) against HEAD `d9177b3` + independent source
+  verification; findings ranked by ROI. The top 5 were: (1) cancelled fetch
+  worker drops files, (2) E7004 retry desyncs the data channel, (3) unbounded
+  CHANNEL_JOIN read, (4) serve() reopen-by-path TOCTOU, (5) digest-cache ctime
+  second-granularity. This session fixed 1/3/4 (MFR-0011/0012/0013); 2 and 5 are
+  deferred for a design/spec decision (see follow-ups).
+- All three were invisible to the suite: every new test fails on the pre-fix
+  tree for exactly the intended reason (verified by stashing the fixes), and the
+  serve test's pre-fix failure is a `FILE_HEADER` — i.e. the outside content was
+  already being streamed.
+- New tests: `receiver/fetch_test.go` `TestFetchCancelledMidFetchRequeues`,
+  `TestFetchCancelledDuringBackoffRequeues` (the stub server cancels *before*
+  answering, so the fetcher is guaranteed to observe a cancelled ctx — no sleep
+  race; the backoff case pushes `attempt: 1` so the un-jittered `rnd == nil`
+  delay is 400ms, a wide cancel window). `sender/run_test.go`
+  `TestAcceptDataBoundsChannelJoinRead` (a silent dialer; the listener is closed
+  500ms in — only a bounded join read lets `acceptData` get back to `Accept` and
+  notice). `sender/serve_test.go` `TestServeRejectsSwappedFileIdentity`
+  (same-size symlink to an outside file swapped in post-scan → E6003 before any
+  chunk).
+- Full gate green: `make ci` (tidy-check, fmt-check, vet, check-goroutines,
+  cover-check) — coverage 85.2%, up from 84.7%.
+- Follow-ups added: **(a)** item 2 — a retryable E7004 aborts the chunk loop
+  mid-file while the worker keeps the channel, so the remaining FILE_CHUNKs of
+  the dead request are read as the *next* request's data. E7004 is the ONLY
+  item-class retryable that does this (E5001/E5006/E7003 are fatal and tear the
+  session down), i.e. the one error the catalogue marks retryable is exactly the
+  one that breaks the protocol. Needs a design call: drain-to-FILE_COMPLETE
+  before requeue, or tag FILE_CHUNK with the request id and discard stale ones.
+  **(b)** item 5 — `digest.CacheKey` has `CtimeSec` and no `CtimeNsec`, so a
+  sub-second mtime-preserving rewrite reuses a stale digest; ARCHITECTURE.md:1022
+  specifies that key, so fixing it is a spec change, not just a code change.
+  **(c)** R-01 — `.github/workflows/build.yml` runs only `make dist`: no test,
+  race, vet, or coverage job, and it publishes a rolling `latest` release on
+  every push to main.
+- **Follow-ups (a) and (b) were then decided and implemented in the same
+  session.** (a) item 2 → option **B**, drop the channel (MFR-0014): `fetchOne`
+  is a named-return with a `streaming` flag set at the FILE_HEADER and cleared
+  at FILE_COMPLETE/FILE_ERROR, and a deferred wrap tags anything returned in
+  that window as `desynced`; `loop` reads the tag, applies the item's normal
+  fate, then returns `lostChannel=true`. Tests
+  `TestFetchMidStreamErrorDropsChannel{,WhenRetriesExhausted}` force a
+  deterministic mid-stream E7001 by occupying `.esync/parts/<id>.part` with a
+  *directory* (EISDIR → item-class, retryable) — a reusable lever for any
+  "destination write fails mid-file" test. (b) item 5 → fixed as a **spec
+  erratum** (MFR-0015): `CtimeNsec` added to `CacheKey`, `keyLen` 49→57,
+  `cacheMagic` v1→v2, both `statkey_linux.go` and `statkey_darwin.go`
+  populated, and ARCHITECTURE §11.3 amended with a dated erratum block.
+- Final gate after all five changes: `make ci` green, coverage 85.4%.
+- Remaining known gaps, ROI-ranked, are in STATUS_SUMMARY.md; the live top
+  three are R-01 (CI runs no tests at all), the sender's `--owner`/
+  `--shutdown-grace`/`--spill-threshold` flags being parsed but not wired, and
+  SESSION_RESUME being designed but not implemented.
 
 ### 2026-09-08 — audit-driven hardening: excluded-dir pruning (R-03) + data-channel-loss recovery (R-24)
 
@@ -210,60 +319,27 @@ fault, or the LAST channel retiring with work still queued is E3005 (R-24).
   full first-signal → summary → exit-5 path is still only exercised end-to-end
   by hand, not in CI).
 
-### 2026-09-07 — grouping + reliability bundle (progress bar, stall detection, size-based groups)
+### 2026-09-07 — grouping + reliability bundle (condensed)
 
-- One bundled batch from four operator complaints after a failed ~43GB resume.
-  Carries a **protocol version bump 1→2** (handshake `protocolVersion`, wire
-  `ProtocolVersion`, plan digest `protocolVersion`, journal `sessionInfo`), so v1
-  journals are invalidated and cross-version pairing is rejected — the operator
-  accepted this.
-- **Fix #1 — progress bar (MFR-0007).** `obs.Progress` was never instantiated by
-  either run path. Added `Progress.Feed(ctx, sample)` (samples live counters on
-  the render interval — keeps the push-model API `TestProgressNoDeadlock`
-  pins), taught `render()` to drop "/ total" when a total is 0 ("not known
-  yet"), and added a smoothed rate + `eta` (REQ-CLI-006). Wired into both
-  `Run`s next to the heartbeat with `defer prog.Stop()`; `ProgressInterval`
-  added to both Configs, plumbed from `*c.progressInterval` in cli.go. Receiver
-  total = running sum from `decider.decideGroup` (`session.neededBytes/
-  neededFiles`, needed entries only, grows per group); sender renders sent-only
-  (it can't know receiver skips).
-- **Fix #2 — bogus E9002.** Split: (a) E9002 reworded (done earlier this
-  session-series, MFR-0004); (b) control-loss before SESSION_SUMMARY now a
-  failure; (c) **stall detection (MFR-0005)** — new `Conn.RecvMsgTimeout(d)`
-  (per-receive read deadline, `net.Error` timeout → E3005), fetcher gained a
-  `stall` field fed from new `--stall-timeout` (default 60s), used on both
-  data-channel receives in `fetchOne`. (d) FILE_CANCEL protocol change —
-  **WONTFIX**, disproportionate (see follow-ups).
-- **Fix #3 — clean re-run.** Addressed by Fix #2c: the hang that left journals
-  half-written is now a clean E3005 exit, so the next run's digest-match resume
-  path sees a consistent journal and skips completed files ("no transfers").
-- **Fix #4 — size-based grouping (MFR-0006).** `computeGroups` walks sorted
-  entries once, opening a new group when the current one is non-empty AND (holds
-  ≥1024 entries OR adding this file's bytes exceeds the `--group-bytes` target,
-  default 512 MiB). Oversize single file = its own group; entries never split.
-  `wire.SessionParams.GroupSize uint32` → `GroupBytes uint64` (advisory).
-  `GroupManifest.FirstFileID` already carried boundaries, so `decide.go` needed
-  zero changes. Digest `group_size u32` slot → literal `0`; `--group-bytes` not
-  folded (MFR-0006). ARCHITECTURE §10.4/§10.5/§9.3/§16.2 and INITIAL_REQS
-  REQ-SCAN-010/024, §4.2, CON-04, glossary rewritten.
-- Full gate green: `gofmt` clean, `go vet ./...`, `go build ./...`,
-  `go test -race ./...` all packages. Coverage on changed packages: obs 87.8%,
-  receiver 84.3%, plan 92.8%, wire 97.0%, channel 77.6%, fault 96.4%.
-  `internal/sender` shows 39.2% in isolation — pre-existing (`Run`/`walk.go` are
-  covered by the root e2e test, not sender unit tests); the 6-line Progress
-  wiring mirrors the untested heartbeat wiring from commit 8a2067a and is
-  exercised by `TestE2ETransfer` (now runs with a 10ms `ProgressInterval`).
-- Tests added: `channel.TestRecvMsgTimeout`, `receiver.TestFetchStallTimeout` +
-  `TestFetchStallTimeoutMidStream`, `receiver.TestDecideAccumulatesNeededTotals`,
-  `obs.TestProgressFeed` + `TestProgressRenderLine`, `plan.TestGroupingBySize`,
-  updated `wire.TestGoldenWire` golden vector for the 8-byte `group_bytes`.
-- Branch: `grouping-and-reliability` (session started on `main`).
-- Follow-ups (new): **FILE_CANCEL** — when the receiver gives up on a file after
-  its retry budget, it does not tell the sender, which keeps the request_id
-  inflight; harmless today (drain watchdog + summary reconcile) but a clean
-  R→S FILE_CANCEL + sender reconciliation would be tidier. Needs a wire message
-  → deferred as not worth another protocol change in this batch. Also: the
-  sender `drain` span still bills the whole transfer (from the prior entry).
+- One bundled batch from four operator complaints after a failed ~43GB resume,
+  carrying a **protocol version bump 1→2** (handshake, wire, plan digest,
+  journal `sessionInfo`): v1 journals are invalidated and cross-version pairing
+  rejected — the operator accepted this.
+- (1) `obs.Progress` was never instantiated by either run path (MFR-0007);
+  added `Progress.Feed`, a smoothed rate + eta, and wiring in both `Run`s.
+  Receiver total is a running sum from `decideGroup` (needed entries only);
+  the sender renders sent-only, as it cannot know receiver skips.
+- (2) Bogus E9002: control-loss before SESSION_SUMMARY is now a failure, and
+  **stall detection (MFR-0005)** arrived as `Conn.RecvMsgTimeout(d)` +
+  `--stall-timeout` (default 60s) on both data-channel receives. This also
+  fixed (3), the half-written journal that broke clean re-runs.
+- (4) Size-based grouping (MFR-0006): `computeGroups` opens a new group at
+  ≥1024 entries or when `--group-bytes` (default 512 MiB) would be exceeded;
+  oversize single file = its own group, entries never split.
+  `SessionParams.GroupSize u32` → `GroupBytes u64` (advisory), digest slot
+  literal `0`, `--group-bytes` deliberately NOT folded into the plan digest.
+- FILE_CANCEL was considered here and deliberately **WONTFIX** as
+  disproportionate — see MFR-0014, where its absence turned out to matter.
 
 ### 2026-09-07 — sender E9002 drain watchdog: deadline → inactivity
 - Compressed: fully captured by MFR-0004 and the follow-up line in the
@@ -271,18 +347,14 @@ fault, or the LAST channel retiring with work still queued is E3005 (R-24).
   ~14:44 with 13GB transferred; the watchdog was armed on `allDecidedCh` while
   decide ran ~20 min ahead of fetch. Fixed by sampling `tracker.progress`.
 
-### 2026-09-07 — 60s groups/channels/bandwidth heartbeat
+### 2026-09-07 — 60s groups/channels/bandwidth heartbeat (condensed)
 
-- New `internal/obs/heartbeat.go`: samples `ctx.Counters().Bytes` every 10s,
-  logs at INFO every 60s: `groups=<ascending ids or "none"> channels=<n>
-  rate=<humanRate>`. `Stop()` is synchronous (a `done` channel the loop closes)
-  so callers can read shared state after it without a `-race` hazard. New
-  `humanRate` (decimal SI) distinct from `humanBytes` (binary). Receiver group
-  ids come from a new `pending map[uint32]int` in `needQueue` (`done(groupID)`
-  signature change, 5 call sites); sender from `tracker.inProgressGroups()` and
-  a new `activeChannels atomic.Int64` around each servicer. Wired into both
-  runs next to the (previously uninstantiated) progress renderer with
-  `defer hb.Stop()`.
+- `internal/obs/heartbeat.go` samples `Counters().Bytes` every 10s and logs
+  `groups=… channels=… rate=…` at INFO every 60s. `Stop()` is synchronous (a
+  `done` channel the loop closes) so callers can read shared state afterwards
+  without a `-race` hazard. Group ids come from `needQueue.pending` on the
+  receiver (hence `done(groupID)`) and `tracker.inProgressGroups()` on the
+  sender; channel count from a new `activeChannels atomic.Int64`.
 
 ### 2026-09-07 — Fix: receiver drain watchdog fires mid-transfer (E9002)
 - Compressed: fully captured by MFR-0003. Original: the receiver armed
@@ -291,73 +363,28 @@ fault, or the LAST channel retiring with work still queued is E3005 (R-24).
   (`decideWg.Wait()`/`q.close()`/`q.waitDrained()`), with `waitGrace` bounding
   the post-cancel unwind.
 
-### 2026-09-04 — Adaptive channel tuner (REQ-PAR-004) + sender-side dynamic join
+### 2026-09-04 — Adaptive channel tuner (REQ-PAR-004) + sender-side dynamic join (condensed)
 
-- Replaced the `tune.go` stub with the real §13.4 controller: `decideRamp` is a
-  pure, unit-tested decision function (n/minCh/maxCh/goodput/bestGoodput/errored
-  → hold|up|down + carried-forward bestGoodput); `session.tune` samples
-  `cnt.Bytes`/`Retries`/`FilesFailed` every 2s on a ticker, ramps +2 channels on
-  >8% goodput improvement (zero errors, n<max), ramps -1 (retiring the most
-  recently opened channel; never the last one — that path is fatal E3005) on
-  >8% regression, holds otherwise, and stops for good after 3 unproductive ramps
-  in a row (hysteresis, RISK-05). `--channels`/`ESYNC_CHANNELS` sets a new
-  `Config.ChannelsPinned` (via `explicitlySet(fs, "channels")` — `fs.Visit` after
-  `applyEnv`, since env application also routes through `fs.Set`) that disables
-  the tuner entirely and pins N; unpinned sessions start at `--min-channels`
-  (default 4) and the tuner owns N from there.
-- `session` grew a dynamic channel pool: `chMu`-guarded `workers []*chanWorker`
-  + `nextChID` + `pipelineDone` bool, with `addChannel`/`retireOne` as the only
-  ways to grow/shrink it and `chWg sync.WaitGroup` tracking every live fetch
-  goroutine. `pipelineDone` is the WaitGroup-race guard (Go: `Add` with a
-  positive delta must not race with a `Wait` that could observe zero) — every
-  `chWg.Add(1)` and the `pipelineDone` transition share `chMu`, so once the flag
-  is set no further `Add` can land before the eventual `chWg.Wait()`. See
-  MFR-0002 for the real bug this surfaced: that flag must flip on the queue
-  being *drained* (`needQueue.waitDrained`, new), not merely closed, or the
-  tuner can never ramp up in practice.
-- Sender side: `internal/sender/run.go` no longer closes its listener right
-  after the initial N data channels (`lst.Close() // the vertical slice does
-  not add channels dynamically` is gone) — it now keeps accepting CHANNEL_JOINs
-  up to `cfg.MaxChannels` in a background `obs.Go("join.accept", ...)` goroutine,
-  starting a `servicer` for each late joiner exactly like the initial batch
-  (`startServicer` factored out of the old inline loop). Without this the
-  receiver's tuner would dial into a closed listener and ramp-up would be a
-  no-op against the real sender, not just the test fake.
-- Test harness (`internal/receiver/run_test.go`'s `fakeSender`): added a
-  background accept-loop mirroring the real sender's late-join behaviour
-  (`AcceptChannel(..., fakeSenderMaxChannels)`, a `joined`/`joinedCount()`
-  counter) and `chunkDelay`/`chunkSize` fields to pace `dataLoop` so a test
-  transfer can be made to span multiple 2s tuning windows without moving much
-  data. The two pre-existing E2E tests now pass `ChannelsPinned: true` so
-  they stay deterministic (previously their `Channels: 1`/`2` was silently
-  ignored — unpinned always used `MinChannels` — harmless there since neither
-  test asserted channel count, but worth pinning explicitly now that it means
-  something).
-- New tests: `tune_test.go` (`TestDecideRamp` — 7-case pure decision table;
-  `TestRunAdaptiveRampUp` — a paced ~3.8s single-file transfer over a real
-  loopback fake sender, asserting `fs.joinedCount() > 2` i.e. the live
-  controller actually opened channels beyond the floor, not just the pure
-  function in isolation). `fetch_test.go`: `TestFetchManifestDigestMismatch`
-  closes the "md5 sent originally from the group manifest must match" gap —
-  content that matches its own FILE_HEADER/streamed FILE_COMPLETE digest but
-  not `fileMeta.digest` (the group manifest's `ManifestEntry.Digest`, copied in
-  `decide.go`) is E8003, item-class/non-retryable/session-survives, and the
-  file is never published.
-- The manifest-digest verification itself (`fetch.go`'s `finish()`, checking
-  local hash against `fc.DigestFull`→E8001, `fm.digest`/`hdr.Digest`→E8003) was
-  already correct before this session — only the test above was missing.
-- Full gate green: `gofmt -l .` clean, `go vet ./...` clean, `go build ./...`,
-  `go test -race ./...` all packages, `make check-goroutines` clean,
-  `go mod tidy -diff` clean, `make cover-check` 83.9% (min 80%).
-- Follow-ups unchanged from prior entries (BLAKE3, `.part` checkpoint resume,
-  SESSION_RESUME, `--owner` not wired into fetch, `--shutdown-grace`/
-  `--spill-threshold` parsed-only) plus one new one: the tuner's "retire the
-  most recently opened channel" ramp-down and its 3-strikes hysteresis are my
-  own reading of an underspecified pseudocode in ARCHITECTURE §13.4 (which
-  channel to retire, and whether a ramp-down counts as "unproductive" — I
-  treated ramp-up as always resetting the streak and ramp-down as always
-  advancing it) — worth a user sanity-check if real-world tuning behaviour
-  ever looks wrong.
+- Built the real §13.4 controller: `decideRamp` (pure, table-tested) + a 2s
+  sampler over `cnt.Bytes`/`Retries`/`FilesFailed`; +2 channels on >8% goodput
+  gain, -1 on >8% regression (never the last channel — that path is fatal
+  E3005), stop after 3 unproductive ramps (RISK-05). `--channels` sets
+  `Config.ChannelsPinned` and disables the tuner; unpinned starts at
+  `--min-channels` (4).
+- `session` gained a dynamic pool (`chMu` + `workers` + `nextChID` +
+  `pipelineDone` + `chWg`); `pipelineDone` is the WaitGroup `Add`-vs-`Wait` race
+  guard, and it must flip on the queue being *drained*, not merely closed — see
+  MFR-0002. Sender keeps its listener open and accepts late CHANNEL_JOINs up to
+  `cfg.MaxChannels` in a `join.accept` goroutine, or ramp-up is a no-op against
+  a real sender.
+- Caveat retained: which channel `retireOne` picks and whether a ramp-down
+  counts as "unproductive" are my reading of an underspecified §13.4 pseudocode
+  (ramp-up resets the streak, ramp-down advances it) — worth a sanity-check if
+  real-world tuning ever looks wrong.
+- Test-harness note: `fakeSender` has a late-join accept loop
+  (`joinedCount()`) and `chunkDelay`/`chunkSize` pacing so a transfer can span
+  several tuning windows cheaply; pre-existing E2E tests now pass
+  `ChannelsPinned: true` (unpinned silently ignored their `Channels:` value).
 
 ### 2026-09-04 — earlier sessions (pruned)
 

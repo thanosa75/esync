@@ -508,7 +508,10 @@ cleartext because framing requires them, and are authenticated because they are 
 30+ct  32   mac            HMAC-SHA256(K_mac[dir][ch], bytes[0 .. 30+ct_len))
 ```
 
-`MAX_CT = 1 MiB + 16` for data channels, `256 KiB + 16` for the control channel.
+`MAX_CT = 1 MiB + 16` for data channels, `512 KiB + 16` for the control channel (raised from
+`256 KiB + 16`: a 1024-entry `GROUP_MANIFEST` with long paths could exceed the old ceiling and fail
+deterministically — R-13. Sender and receiver read the same constant, so this is not a
+cross-version wire break; §10.4 grouping keeps every `GROUP_MANIFEST` safely under the new ceiling).
 
 ### 8.2 Receive discipline
 
@@ -938,7 +941,9 @@ file_id = index in the sorted order, zero-based
 walk the sorted entries once, opening a new group when the current one is
 non-empty and either:
   - it already holds GROUP_ENTRY_CAP (1024) entries, or
-  - adding this entry's file size would push the group past GROUP_BYTES.
+  - adding this entry's file size would push the group past GROUP_BYTES, or
+  - adding this entry's encoded GROUP_MANIFEST size would push the group's manifest past
+    MAX_GROUP_MANIFEST_BYTES.
 ```
 `GROUP_BYTES` is `--group-bytes` (default 512 MiB). Groups are contiguous ranges of file ids, so
 group membership never needs to be transmitted (`REQ-SCAN-024`); the range boundaries are carried
@@ -948,6 +953,19 @@ plan, so the entry cap is a statement about the plan and not about a subset of i
 
 A single file larger than `GROUP_BYTES` forms its own group: the target only *closes* a group, it
 never splits one entry across groups, and the entry cap still bounds `GROUP_MANIFEST` size.
+
+`MAX_GROUP_MANIFEST_BYTES` is a third, independent cap (R-13): the entry cap alone does not bound
+`GROUP_MANIFEST` wire size, because manifest paths are `u16`-length (up to 64 KiB each) with ~30
+bytes of fixed per-entry overhead plus a worst-case digest, so a group of 1024 long-path entries
+could encode past the control-channel record ceiling (§8.1 `MAX_CT`) and be rejected outright by the
+record writer (`E5003`) — deterministically, on every retry, since the resume journal replays the
+same group. `internal/plan` derives `MAX_GROUP_MANIFEST_BYTES` from `MAX_CT` (with margin for
+PKCS#7 padding and future field growth) and closes a group before it would cross that budget, using
+each entry's exact wire-encoded size (worst-case digest length assumed, since content is hashed
+lazily and is not yet known at grouping time). Like `GROUP_BYTES`, a single entry whose own encoded
+size already exceeds the budget still forms its own one-entry group rather than being dropped or
+looping. This cap is derived purely from the wire format and the fixed `MAX_CT` ceiling, not from
+`--group-bytes`, so it does not change the digest-folding rule below.
 
 `--group-bytes` is a pure transport-tuning knob: it is deliberately **not** folded into the manifest
 digest (§10.5), so re-running with a different value does not invalidate a resume journal. The
@@ -1019,11 +1037,22 @@ Satisfies `REQ-HASH-005`, `REQ-HASH-006`. Both sides may keep a cache at
 `${XDG_CACHE_HOME:-~/.cache}/esync/digests.db`.
 
 ```
-key    = (device, inode, size, mtime_sec, mtime_nsec, ctime_sec, hash_alg)
+key    = (device, inode, size, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec, hash_alg)
 value  = digest
 ```
 
-Including `ctime` catches in-place modifications that preserve `mtime`. The cache is **advisory**:
+Including `ctime` catches in-place modifications that preserve `mtime`.
+
+> **Erratum (2026-09-22).** This key originally specified `ctime_sec` only. At second
+> granularity the guarantee above does not hold: a rewrite that preserves size and `mtime`
+> and lands in the same wall-clock second as the previous `ctime` — routine for generated
+> files, and for anything restored by `rsync`, `tar`, or `git checkout` — is a stale cache
+> **hit**, and the receiver skips a file that changed. The cache is advisory for *speed*
+> but authoritative for that *skip decision*, so the key must be exact. `ctime_nsec` is now
+> part of the key and the on-disk cache magic is `esync digest cache v2`; a `v1` file is
+> discarded on open by the existing version check.
+
+The cache is **advisory**:
 a missing file, a schema-version mismatch, a corrupt record, or a failed open causes a `DEBUG` log
 and a full hash. It is never authoritative for correctness, only for speed. `--no-cache` disables it.
 

@@ -4,6 +4,56 @@
 **Scope:** every non-test package (root, `internal/{channel,crypto,digest,fault,fsx,obs,paircode,plan,receiver,sender,wire}` ≈ 20 kLOC) cross-checked against `doc/ARCHITECTURE.md` (§1–21, incl. the 156-row §18.1 matrix), `doc/INITIAL_REQS.md` (156 REQ-ids), and `doc/MEMORY.md` (MFRs + known follow-ups).
 **Method:** nine parallel subsystem audits (each read its full doc sections + full package source, cited file:line), plus independent re-verification here of the top ~12 load-bearing claims, plus ground-truth gate runs. Effort scale: S <½ d · M 1–2 d · L 3–5 d · XL >5 d. Findings marked **KNOWN** were already listed as MEMORY.md follow-ups; **NEW** were not. No re-reported MFR (fixed bug) appears. **Re-audit 2026-09-08:** three parallel read-only agents (§4–8 security/transport, §9–13 pipeline, §14–21 meta) re-ran the same doc-vs-code check against HEAD `ae19178`; every finding below was re-confirmed with unchanged file:line evidence and no new critical issue surfaced.
 
+### Bug-hunt delta (2026-09-22, HEAD `d9177b3` + working tree)
+
+Four Sonnet agents exercised send/receive on one host hunting for defects the unit
+suite misses; every claim was re-verified in source here. Five findings were ranked
+by ROI and **all five are now fixed**, each with a test that fails on the pre-fix
+tree (verified by stashing the fix). `make ci` green, coverage **85.4 %**.
+
+- **RESOLVED — R-17**: the accepted conn now gets `SetDeadline(HandshakeTimeout)`
+  before `handshake.AcceptChannel` and a cleared deadline after
+  (`sender/run.go:501`), so a silent on-LAN connector can no longer park the accept
+  loop. Test `sender.TestAcceptDataBoundsChannelJoinRead`. MEMORY MFR-0012. The
+  receiver's `dialOneData` comment claiming the sender already bounded this was
+  simply wrong — worth noting, since that comment is probably why the gap survived
+  earlier review.
+- **RESOLVED — R-38 (NEW, `HIGH`, S)**: a fetch worker cancelled mid-file called
+  `q.done()` on a file it never fetched. Reachable in a *live* session via the
+  §13.4 tuner's `retireOne`, so the destination silently loses a file on an
+  otherwise exit-0 run; it also swallowed a fatal and let `waitDrained` fire early.
+  Both cancel sites in `fetch.go` now requeue. Tests
+  `receiver.TestFetchCancelledMidFetchRequeues`,
+  `…DuringBackoffRequeues`. MEMORY MFR-0011.
+- **RESOLVED — R-39 (NEW, `HIGH`, M)**: an item-class error raised between the
+  FILE_HEADER and a terminal message left the dead request's chunks unread on the
+  wire; the worker then reused the channel and read that tail as the next request's
+  header → bogus session-fatal E5001. E7004 (destination write error) is the only
+  Item/retryable class that can do this — i.e. the one code the catalogue marks
+  "retried" could not retry. Fixed by option **B**: tag the error `desynced`, give
+  the item its normal fate, then end the worker so §7.3 rejoins. Tests
+  `receiver.TestFetchMidStreamErrorDropsChannel{,WhenRetriesExhausted}`.
+  MEMORY MFR-0014. This makes **R-36** (receiver emits FILE_CANCEL) less urgent:
+  FILE_CANCEL could not have fixed this anyway, since `serve()` runs synchronously
+  inside `run()` and never reads the channel mid-stream.
+- **RESOLVED — R-40 (NEW, `MED`, S)**: `serve()` reopens by path with a plain
+  `os.Open`, so a file swapped for a symlink after the scan was streamed to the
+  peer in full — the manifest-digest check fires only once the bytes are already on
+  the wire. Identity is now verified on the open fd (`Dev`/`Ino` from the plan
+  entry, plus `Mode().IsRegular()`) before the first chunk (`sender/serve.go:116`).
+  Test `sender.TestServeRejectsSwappedFileIdentity`. MEMORY MFR-0013. Note `os.Root`
+  is NOT the right tool here: `--follow-symlinks` legitimately serves content
+  through symlinks that escape the root.
+- **RESOLVED — R-41 (NEW, `MED`, S) — spec erratum**: the digest cache key carried
+  `ctime_sec` only, so an in-place rewrite preserving size and mtime within the same
+  wall-clock second was a stale cache **hit** and the receiver skipped a changed
+  file. `ctime_nsec` added to the key, `cacheMagic` v1→v2 (old files discarded by the
+  existing version check), and ARCHITECTURE §11.3 amended with a dated erratum block.
+  Tests `digest.TestCacheKeyDistinguishesCtimeNsec`,
+  `digest.TestCacheMissesOnMtimePreservingRewrite`. MEMORY MFR-0015.
+
+---
+
 ### Re-audit delta (2026-09-08, HEAD `ae19178`)
 
 - **RESOLVED — R-09** (commit `ae19178`): second-signal / `--shutdown-grace` force-exit backstop implemented. `cli.go` `signalEscape`/`installSignalEscape` exit 5 after a second SIGINT/SIGTERM or grace expiry, wired into both run paths (`cli.go:324`, `cli.go:426`); receiver closes the control conn on first signal to unblock the parked reader (`receiver/run.go`); `doc/MEMORY.md` MFR-0008; `cli_test.go` coverage added. `--shutdown-grace` is no longer dead.
@@ -123,7 +173,7 @@ ROI = impact ÷ effort. Tier 1 items each either prevent silent wrong output, ma
 - Docs: §12.4 / REQ-FS-003 ("correctness preserved" via content fallback). Code: a secondary decided while its primary is still in flight is parked by `claimSecondary` (`receiver/decide.go:364-365`) and is only materialised when the primary publishes (`fetch.go:208-212` `registerMaterialised`); if the primary is **skipped** (prior-resume or identical-content skip) it never publishes and the secondary is never linked *or* fetched; a deferred-link failure at `fetch.go:209` is warn-only with no content fallback and no `FilesFailed`.
 - Impact: hardlinked trees onto link-less destinations (FAT/exFAT/FUSE) or after a resume can end with files absent, journal clean, exit 0.
 
-**R-17 · CHANNEL_JOIN/ACCEPT has no read deadline — silent on-LAN connector parks the sender** · `MED` · S · NEW
+**R-17 · CHANNEL_JOIN/ACCEPT has no read deadline — silent on-LAN connector parks the sender** · `MED` · S · NEW · **RESOLVED 2026-09-22** (see bug-hunt delta; MEMORY.md MFR-0012)
 - Docs: REQ-NET-010 ("no code path may wait forever"). Code: `handshake/channel.go:65` (`io.ReadFull`) and `channel.go:48` have no deadline; keepalive is enabled only after join. A peer that connects and sends nothing parks the accept loop indefinitely; no E-code fires. Add a deadline mirroring `--handshake-timeout`.
 
 **R-18 · Receiver cross-group ordering is not enforced under the concurrent decide pool** · `MED` · M · NEW
