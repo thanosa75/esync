@@ -377,8 +377,53 @@ func TestDecideHardlinkDefersSecondary(t *testing.T) {
 		t.Fatalf("SkippedCount = %d, want 1 (deferred secondary)", gd.SkippedCount)
 	}
 	// fetch would call registerMaterialised(0, "first.dat"); simulate it.
-	if w := td.dec.hl.registerMaterialised(0, "first.dat"); len(w) != 1 || w[0] != "second.dat" {
-		t.Fatalf("pending secondaries = %v, want [second.dat]", w)
+	if w := td.dec.hl.registerMaterialised(0, "first.dat"); len(w) != 1 || w[0].rel != "second.dat" || w[0].fileID != 1 {
+		t.Fatalf("pending secondaries = %+v, want [{1 second.dat}]", w)
+	}
+}
+
+// R-16: when the hardlink primary is resolved by SKIP (already present at the
+// destination with matching content) rather than a fetch/publish, it never
+// reaches fetch.go's post-publish registerMaterialised. Without the decide-time
+// fallback, a secondary parked on that key would never be linked and never be
+// fetched: present in the manifest, absent from the destination, exit 0.
+func TestDecideHardlinkMaterialisesSecondaryOnSkippedPrimary(t *testing.T) {
+	td := newTestDecider(t, Config{}.withDefaults(), fsx.PlatformLinux, nil)
+	data := []byte("shared inode contents, already on disk")
+	// The primary's content is already correct at the destination, so decide
+	// will resolve it via SKIP, not a fetch.
+	if err := os.WriteFile(filepath.Join(td.dir, "first.dat"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e1 := fileEntry("first.dat", data, md5sum(t, data), time.Unix(1, 0))
+	e1.Flags = wire.ManifestFlagHasHardlinkKey
+	e1.HardlinkKey = 777
+	e2 := fileEntry("second.dat", data, md5sum(t, data), time.Unix(1, 0))
+	e2.Flags = wire.ManifestFlagHasHardlinkKey
+	e2.HardlinkKey = 777
+	gm := &wire.GroupManifest{Entries: []wire.ManifestEntry{e1, e2}}
+	if err := td.dec.decideGroup(context.Background(), gm); err != nil {
+		t.Fatalf("decideGroup: %v", err)
+	}
+	gd := td.log.only(t)
+	if len(gd.Needed) != 0 {
+		t.Fatalf("Needed = %v, want none (primary skipped, secondary never fetched)", gd.Needed)
+	}
+	if gd.SkippedCount != 2 {
+		t.Fatalf("SkippedCount = %d, want 2", gd.SkippedCount)
+	}
+	got, err := os.ReadFile(filepath.Join(td.dir, "second.dat"))
+	if err != nil {
+		t.Fatalf("second.dat must be materialised even though its primary was a SKIP: %v", err)
+	}
+	if string(got) != string(data) {
+		t.Fatalf("second.dat content = %q, want %q", got, data)
+	}
+	fi1, err1 := os.Stat(filepath.Join(td.dir, "first.dat"))
+	fi2, err2 := os.Stat(filepath.Join(td.dir, "second.dat"))
+	if err1 != nil || err2 != nil || !os.SameFile(fi1, fi2) {
+		t.Fatalf("second.dat must be hardlinked to first.dat (same inode), got err1=%v err2=%v same=%v",
+			err1, err2, err1 == nil && err2 == nil && os.SameFile(fi1, fi2))
 	}
 }
 

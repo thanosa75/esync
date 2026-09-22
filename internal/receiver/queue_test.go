@@ -211,3 +211,45 @@ func TestQueuePopContextCancel(t *testing.T) {
 		t.Fatal("pop returned ok after context cancel")
 	}
 }
+
+// TestQueuePushFallbackNeverBlocksWhenFull pins the property that makes the
+// R-16 content fallback safe: pushFallback is called from a fetcher worker —
+// the same goroutine that pops — so it must never wait for a free slot. If it
+// blocked like pushGroup, a full queue with every worker parked in the
+// fallback would leave nobody to pop, and the session would hang until the
+// drain watchdog fired a misleading E9002.
+func TestQueuePushFallbackNeverBlocksWhenFull(t *testing.T) {
+	q := newNeedQueue(1)
+	if err := q.pushGroup(context.Background(), []needItem{{fileID: 1, groupID: 7, size: 10, rel: "a"}}); err != nil {
+		t.Fatalf("pushGroup: %v", err)
+	}
+	if got := q.depth(); got != 1 {
+		t.Fatalf("depth = %d, want 1 (queue must be at capacity for this test to mean anything)", got)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- q.pushFallback(needItem{fileID: 2, groupID: 7, size: 10, rel: "b"})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pushFallback on a full queue: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pushFallback blocked on a full queue; it is called from the popping goroutine, so this deadlocks the drain")
+	}
+
+	// The item must really be queued and must be accounted to its group, so
+	// the run cannot report drained while the fallback is still outstanding.
+	if got := q.depth(); got != 2 {
+		t.Errorf("depth = %d, want 2 (fallback item queued despite capacity)", got)
+	}
+	if got := q.inProgressGroups(); len(got) != 1 || got[0] != 7 {
+		t.Errorf("inProgressGroups = %v, want [7]", got)
+	}
+	q.close()
+	if q.drained() {
+		t.Error("drained() is true with a fallback item still queued")
+	}
+}

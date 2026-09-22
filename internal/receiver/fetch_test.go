@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -254,6 +255,48 @@ func TestFetchManifestDigestMismatch(t *testing.T) {
 	}
 }
 
+// R-16: if a hardlink secondary cannot be linked once its primary publishes,
+// finish() must fall back to fetching its content as an ordinary file instead
+// of leaving it silently missing (§12.4 content fallback) or letting the run
+// exit 0 with a hole in the destination.
+//
+// MakeHardlink is forced to fail deterministically and portably (no root or
+// second filesystem needed to get a genuine EXDEV/ENOTSUP) by pointing it at a
+// primary path that was never published — the same trigger
+// internal/fsx.TestHardlink uses for MakeHardlink's E7009 ("does-not-exist")
+// case — while still exercising the real linkOrFallback/fallbackFetch code
+// finish() calls after a successful publish.
+func TestFetchHardlinkFallsBackToContentOnLinkFailure(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+
+	secData := []byte("secondary content fetched instead of linked")
+	secDig := md5sum(t, secData)
+	h.f.meta.set(1, fileMeta{rel: "second.dat", size: int64(len(secData)), mode: 0o644, mtime: time.Unix(1000, 0), digest: secDig})
+
+	go serveRequests(t, sConn, map[uint64]*stubFile{1: {data: secData, dig: secDig}})
+
+	// Simulate what finish() does once a hardlink primary publishes: link its
+	// parked secondaries, or fall back. "does-not-exist-primary.dat" was never
+	// published, so MakeHardlink fails.
+	h.f.linkOrFallback(context.Background(), 0, "does-not-exist-primary.dat",
+		[]pendingLink{{fileID: 1, rel: "second.dat"}})
+
+	h.q.close()
+	h.f.loop(context.Background())
+
+	if e := h.failErr.Load(); e != nil {
+		t.Fatalf("fetch failed: %v", e)
+	}
+	if h.cnt.FilesFailed.Load() != 0 {
+		t.Fatalf("FilesFailed = %d, want 0 (content fallback should succeed)", h.cnt.FilesFailed.Load())
+	}
+	got, err := os.ReadFile(filepath.Join(h.dir, "second.dat"))
+	if err != nil || string(got) != string(secData) {
+		t.Fatalf("second.dat must be fetched as ordinary content when the link fails: got %q, err %v", got, err)
+	}
+}
+
 // T-XFER: a data channel that accepts a FILE_REQUEST and then goes silent must
 // not hang the fetcher. The per-receive stall timeout trips E3005 (fatal,
 // resumable) so the session can end and be re-run from the journal.
@@ -348,5 +391,187 @@ func TestFetchFatalOnOffsetGap(t *testing.T) {
 	e, _ := h.failErr.Load().(error)
 	if fault.GetCode(e) != fault.E5006 {
 		t.Fatalf("fail error = %v, want E5006", e)
+	}
+}
+
+// MFR-0011: a worker cancelled while a fetch is in flight — the adaptive tuner
+// retiring a channel (§13.4) leaves the session running — must hand the item
+// back. Resolving it would leave a hole in the destination on an exit-0 run.
+func TestFetchCancelledMidFetchRequeues(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		m, err := sConn.RecvMsg()
+		if err != nil {
+			return
+		}
+		req := m.(*wire.FileRequest)
+		// Cancel before answering: the fetcher is parked in the receive until
+		// this error lands, so it is guaranteed to observe a cancelled ctx.
+		cancel()
+		_ = sConn.SendMsg(&wire.FileError{RequestID: req.RequestID, Code: 6004, Retryable: 1, Message: "transient"})
+	}()
+
+	data := []byte("never arrives")
+	h.enqueue(t, 0, "hole.bin", data, md5sum(t, data))
+	h.q.close()
+
+	loopDone := make(chan struct{})
+	go func() { h.f.loop(ctx); close(loopDone) }()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch loop did not return")
+	}
+
+	if h.q.drained() {
+		t.Fatal("queue drained: a file nobody fetched was marked resolved")
+	}
+	if len(h.q.items) != 1 || h.q.items[0].fileID != 0 {
+		t.Fatalf("queued items = %+v, want the unfetched file back", h.q.items)
+	}
+	if h.q.items[0].attempt != 0 {
+		t.Fatalf("attempt = %d, want 0: cancellation is not a failed attempt", h.q.items[0].attempt)
+	}
+}
+
+// MFR-0011: cancellation during the retry backoff must requeue too. The retry was
+// already decided and counted, so the attempt is consumed — but the file is not
+// dropped.
+func TestFetchCancelledDuringBackoffRequeues(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		m, err := sConn.RecvMsg()
+		if err != nil {
+			return
+		}
+		req := m.(*wire.FileRequest)
+		_ = sConn.SendMsg(&wire.FileError{RequestID: req.RequestID, Code: 6004, Retryable: 1, Message: "transient"})
+		// The harness fetcher has rnd == nil, so the backoff for attempt 1 is
+		// an un-jittered 400ms. Cancel well inside it.
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	data := []byte("retry me")
+	h.f.meta.set(0, fileMeta{rel: "retry.bin", size: int64(len(data)), mode: 0o644, mtime: time.Unix(1000, 0), digest: md5sum(t, data)})
+	if err := h.q.pushGroup(context.Background(), []needItem{{fileID: 0, size: int64(len(data)), rel: "retry.bin", attempt: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	h.q.close()
+
+	loopDone := make(chan struct{})
+	go func() { h.f.loop(ctx); close(loopDone) }()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch loop did not return")
+	}
+
+	if h.q.drained() {
+		t.Fatal("queue drained: a file awaiting retry was marked resolved")
+	}
+	if len(h.q.items) != 1 || h.q.items[0].fileID != 0 {
+		t.Fatalf("queued items = %+v, want the pending retry back", h.q.items)
+	}
+	if h.q.items[0].attempt != 2 {
+		t.Fatalf("attempt = %d, want 2: the decided retry is consumed", h.q.items[0].attempt)
+	}
+	if h.cnt.Retries.Load() != 1 {
+		t.Fatalf("Retries = %d, want 1", h.cnt.Retries.Load())
+	}
+}
+
+// blockPartFile makes OpenPart(fileID) fail with EISDIR (→ E7001, item-class and
+// retryable) by occupying the part path with a directory. The failure lands
+// after the FILE_HEADER is consumed, while the sender is still streaming — the
+// mid-stream abort that desyncs the channel.
+func blockPartFile(t *testing.T, dir string, fileID uint64) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".esync", "parts", strconv.FormatUint(fileID, 10)+".part"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// MFR-0014: an item-class error raised mid-stream leaves the dead request's chunks
+// unread on the wire. The item keeps its normal retry budget, but the worker
+// must end so the channel is rejoined (§7.3 row 1) — reusing it would read that
+// tail as the next request's FILE_HEADER and kill the session with a bogus
+// E5001.
+func TestFetchMidStreamErrorDropsChannel(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+	data := make([]byte, 300000) // several chunks still in flight when we fail
+	dig := md5sum(t, data)
+
+	go serveRequests(t, sConn, map[uint64]*stubFile{0: {data: data, dig: dig}})
+
+	blockPartFile(t, h.dir, 0)
+	h.enqueue(t, 0, "blocked.bin", data, dig)
+	h.q.close()
+
+	lostCh := make(chan bool, 1)
+	go func() { lostCh <- h.f.loop(context.Background()) }()
+	var lost bool
+	select {
+	case lost = <-lostCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetch loop did not return")
+	}
+
+	if !lost {
+		t.Fatal("loop kept a desynced channel: the next request would read the dead request's tail")
+	}
+	if e := h.failErr.Load(); e != nil {
+		t.Fatalf("session failed on a recoverable item error: %v", e)
+	}
+	if len(h.q.items) != 1 || h.q.items[0].fileID != 0 {
+		t.Fatalf("queued items = %+v, want the file requeued for another channel", h.q.items)
+	}
+	if h.q.items[0].attempt != 1 {
+		t.Fatalf("attempt = %d, want 1: a mid-stream abort still spends a retry", h.q.items[0].attempt)
+	}
+}
+
+// The companion to the above: a desynced channel is dropped even when the item
+// has no retries left. The item is failed and resolved (no rejoin-forever loop
+// on failing media), and the channel still ends.
+func TestFetchMidStreamErrorDropsChannelWhenRetriesExhausted(t *testing.T) {
+	sConn, rConn := connPair(t, 1)
+	h := newFetchHarness(t, rConn)
+	h.f.cfg.MaxRetries = 0
+	data := make([]byte, 100000)
+	dig := md5sum(t, data)
+
+	go serveRequests(t, sConn, map[uint64]*stubFile{0: {data: data, dig: dig}})
+
+	blockPartFile(t, h.dir, 0)
+	h.enqueue(t, 0, "blocked.bin", data, dig)
+	h.q.close()
+
+	lostCh := make(chan bool, 1)
+	go func() { lostCh <- h.f.loop(context.Background()) }()
+	var lost bool
+	select {
+	case lost = <-lostCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetch loop did not return")
+	}
+
+	if !lost {
+		t.Fatal("loop kept a desynced channel after failing the item")
+	}
+	if h.cnt.FilesFailed.Load() != 1 {
+		t.Fatalf("FilesFailed = %d, want 1", h.cnt.FilesFailed.Load())
+	}
+	if !h.q.drained() {
+		t.Fatalf("queue not drained: a permanently failed file must be resolved, items=%+v", h.q.items)
 	}
 }

@@ -134,16 +134,16 @@ func TestSpaceGuardWarnThenFatal(t *testing.T) {
 
 func TestHardlinkMapSecondaryFlow(t *testing.T) {
 	h := newHardlinkMap()
-	if h.claimSecondary(42, "b.txt") {
+	if h.claimSecondary(42, 200, "b.txt") {
 		t.Fatal("first sighting of a key must not be a secondary")
 	}
 	h.markPrimary(100, 42)
-	if !h.claimSecondary(42, "b.txt") {
+	if !h.claimSecondary(42, 200, "b.txt") {
 		t.Fatal("second sighting must be deferred as a secondary")
 	}
 	waiting := h.registerMaterialised(100, "a.txt")
-	if len(waiting) != 1 || waiting[0] != "b.txt" {
-		t.Fatalf("waiting = %v, want [b.txt]", waiting)
+	if len(waiting) != 1 || waiting[0].rel != "b.txt" || waiting[0].fileID != 200 {
+		t.Fatalf("waiting = %+v, want [{200 b.txt}]", waiting)
 	}
 	if p, ok := h.pathFor(42); !ok || p != "a.txt" {
 		t.Fatalf("pathFor = %q,%v", p, ok)

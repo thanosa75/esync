@@ -17,8 +17,9 @@ type needItem struct {
 
 // needQueue is the ordered, bounded, resumable need queue (ARCHITECTURE §13.2,
 // §13.6). Groups are appended in ascending order; within a group items are
-// ordered largest-first. It never exceeds its capacity, never drops an item,
-// and never yields the same item twice [P-QUEUE-01]. pushGroup blocks while the
+// ordered largest-first. It never drops an item and never yields the same item
+// twice [P-QUEUE-01]. pushGroup never exceeds its capacity; pushFallback may
+// overshoot it by a bounded amount (see there). pushGroup blocks while the
 // queue is full, which is the backpressure that stops the decide pool emitting
 // CREDIT (§13.5).
 type needQueue struct {
@@ -92,6 +93,28 @@ func (q *needQueue) requeue(it needItem) {
 	}
 	q.items = append(q.items, it)
 	q.notEmpty.Broadcast()
+}
+
+// pushFallback enqueues a single item that was never part of any
+// GROUP_DECISION: a hardlink secondary whose link failed and must be fetched
+// as content instead (§12.4 / R-16). Unlike pushGroup it never blocks on
+// capacity, because it is called from a fetcher worker — the same goroutine
+// that pops. Waiting for a slot there can deadlock the whole drain: with the
+// queue full and every worker parked here, no one is left to pop, so no slot
+// can ever free and the session hangs until the drain watchdog fires a
+// misleading E9002. The resulting overshoot is bounded by the number of
+// hardlink secondaries whose link failed, never by the plan size.
+func (q *needQueue) pushFallback(it needItem) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return errQueueClosed
+	}
+	q.items = append(q.items, it)
+	q.pushed++
+	q.pending[it.groupID]++
+	q.notEmpty.Broadcast()
+	return nil
 }
 
 // pop returns the next item. ok is false once the queue is drained: no items,

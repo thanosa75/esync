@@ -59,15 +59,24 @@ func (s *metaStore) get(id uint64) (fileMeta, bool) {
 	return fm, ok
 }
 
+// pendingLink is one secondary waiting for its primary's key to be
+// materialised. fileID (in addition to rel) lets the R-16 fallback path look
+// the secondary's own fileMeta up in metaStore and enqueue a content fetch if
+// the hardlink itself cannot be made (§12.4).
+type pendingLink struct {
+	fileID uint64
+	rel    string
+}
+
 // hardlinkMap maps a hardlink_key to the first destination path materialised for
 // it (ARCHITECTURE §12.4). fileKey records which needed file is the pending
 // primary for a key so fetch can register the path once it publishes.
 type hardlinkMap struct {
 	mu        sync.Mutex
-	keyToPath map[uint64]string   // key -> first materialised destination path
-	fileKey   map[uint64]uint64   // primary fileID -> key
-	seen      map[uint64]bool     // key has a primary assigned this session
-	pending   map[uint64][]string // key -> secondary paths awaiting the primary
+	keyToPath map[uint64]string        // key -> first materialised destination path
+	fileKey   map[uint64]uint64        // primary fileID -> key
+	seen      map[uint64]bool          // key has a primary assigned this session
+	pending   map[uint64][]pendingLink // key -> secondaries awaiting the primary
 }
 
 func newHardlinkMap() *hardlinkMap {
@@ -75,7 +84,7 @@ func newHardlinkMap() *hardlinkMap {
 		keyToPath: make(map[uint64]string),
 		fileKey:   make(map[uint64]uint64),
 		seen:      make(map[uint64]bool),
-		pending:   make(map[uint64][]string),
+		pending:   make(map[uint64][]pendingLink),
 	}
 }
 
@@ -86,10 +95,11 @@ func (h *hardlinkMap) pathFor(key uint64) (string, bool) {
 	return p, ok
 }
 
-// claimSecondary records rel as a link to be made once the primary for key is
-// materialised, when a primary has already been assigned. It returns false when
-// this is the first sighting of key (the caller then becomes the primary).
-func (h *hardlinkMap) claimSecondary(key uint64, rel string) bool {
+// claimSecondary records fileID/rel as a link to be made once the primary for
+// key is materialised, when a primary has already been assigned. It returns
+// false when this is the first sighting of key (the caller then becomes the
+// primary).
+func (h *hardlinkMap) claimSecondary(key, fileID uint64, rel string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !h.seen[key] {
@@ -99,7 +109,7 @@ func (h *hardlinkMap) claimSecondary(key uint64, rel string) bool {
 		_ = p // primary already on disk; caller links directly via pathFor
 		return false
 	}
-	h.pending[key] = append(h.pending[key], rel)
+	h.pending[key] = append(h.pending[key], pendingLink{fileID: fileID, rel: rel})
 	return true
 }
 
@@ -118,10 +128,11 @@ func (h *hardlinkMap) clear(key uint64) {
 	h.mu.Unlock()
 }
 
-// registerMaterialised is called by fetch after a successful publish; it returns
-// the secondary paths that were waiting on this file's key so the caller can
-// hardlink them to rel.
-func (h *hardlinkMap) registerMaterialised(fileID uint64, rel string) []string {
+// registerMaterialised is called once fileID's content is known-correct at rel
+// — either fetch publishing it, or decide finding it already resolved by a
+// SKIP (R-16) — and returns the secondaries that were waiting on this file's
+// key so the caller can hardlink them to rel.
+func (h *hardlinkMap) registerMaterialised(fileID uint64, rel string) []pendingLink {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	key, ok := h.fileKey[fileID]
@@ -229,15 +240,7 @@ func (d *decider) decideGroup(ctx context.Context, gm *wire.GroupManifest) error
 			d.decideSymlink(rel, e)
 			skipped++
 		default:
-			need := d.decideFile(rel, fileID, e)
-			if !need {
-				skipped++
-				d.counters.FilesSkipped.Add(1)
-				continue
-			}
-			needed = append(needed, idx)
-			neededBytes += int64(e.Size)
-			d.meta.set(fileID, fileMeta{
+			fm := fileMeta{
 				rel:      rel,
 				size:     int64(e.Size),
 				mode:     os.FileMode(e.Mode).Perm(),
@@ -245,7 +248,25 @@ func (d *decider) decideGroup(ctx context.Context, gm *wire.GroupManifest) error
 				digest:   append([]byte(nil), e.Digest...),
 				hlKey:    e.HardlinkKey,
 				hasHLKey: e.Flags&wire.ManifestFlagHasHardlinkKey != 0,
-			})
+			}
+			if fm.hasHLKey {
+				// Needed even if this entry turns out not to need fetching: a
+				// hardlink secondary parked on this key may have to be
+				// fetched as ordinary content later (R-16 fallback), and that
+				// needs this file's size/mode/mtime/digest.
+				d.meta.set(fileID, fm)
+			}
+			need := d.decideFile(ctx, gm.GroupID, rel, fileID, e)
+			if !need {
+				skipped++
+				d.counters.FilesSkipped.Add(1)
+				continue
+			}
+			if !fm.hasHLKey {
+				d.meta.set(fileID, fm)
+			}
+			needed = append(needed, idx)
+			neededBytes += int64(e.Size)
 			items = append(items, needItem{fileID: fileID, groupID: gm.GroupID, size: int64(e.Size), rel: rel})
 		}
 	}
@@ -348,7 +369,8 @@ func (d *decider) decideSymlink(rel string, e wire.ManifestEntry) {
 
 // decideFile applies the §11.2 table. It returns true when the file's content
 // must be fetched.
-func (d *decider) decideFile(rel string, fileID uint64, e wire.ManifestEntry) bool {
+func (d *decider) decideFile(ctx context.Context, groupID uint32, rel string, fileID uint64, e wire.ManifestEntry) bool {
+	isPrimary := false
 	if e.Flags&wire.ManifestFlagHasHardlinkKey != 0 {
 		key := e.HardlinkKey
 		if p, ok := d.hl.pathFor(key); ok {
@@ -361,14 +383,33 @@ func (d *decider) decideFile(rel string, fileID uint64, e wire.ManifestEntry) bo
 				obs.LogFault(d.octx, err)
 				d.hl.clear(key) // §12.4: fall back to fetching the content
 			}
-		} else if d.hl.claimSecondary(key, rel) {
-			// A primary is pending; fetch will create this link once it lands.
+		} else if d.hl.claimSecondary(key, fileID, rel) {
+			// A primary is pending; fetch will create this link once it lands,
+			// or decide will materialise it here if the primary turns out to
+			// be a SKIP rather than a publish (R-16, see below).
 			return false
 		} else {
 			d.hl.markPrimary(fileID, key)
+			isPrimary = true
 		}
 	}
 
+	need := d.decideFileContent(rel, e)
+
+	// R-16: a hardlink primary resolved by SKIP never publishes, so fetch's
+	// registerMaterialised (called post-publish) is never reached and any
+	// secondary parked on this key would otherwise stay absent from the
+	// destination forever. Materialise them now against the already-present
+	// rel.
+	if isPrimary && !need && !d.dryRun {
+		d.linkOrFallback(ctx, groupID, rel, d.hl.registerMaterialised(fileID, rel))
+	}
+	return need
+}
+
+// decideFileContent is the §11.2 existence/size/mtime/digest comparison. It
+// returns true when the file's content must be fetched.
+func (d *decider) decideFileContent(rel string, e wire.ManifestEntry) bool {
 	fi, err := d.dest.Root().Lstat(rel)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -395,6 +436,53 @@ func (d *decider) decideFile(rel string, fileID uint64, e wire.ManifestEntry) bo
 		return true
 	}
 	return !bytes.Equal(local, e.Digest)
+}
+
+// linkOrFallback hardlinks each pending secondary to primaryRel (already
+// known-correct content). If MakeHardlink itself fails, it falls back to
+// fetching that secondary's content as an ordinary needed file (ARCHITECTURE
+// §12.4) instead of leaving it silently absent from the destination (R-16).
+func (d *decider) linkOrFallback(ctx context.Context, groupID uint32, primaryRel string, pending []pendingLink) {
+	for _, sec := range pending {
+		if err := d.dest.MakeHardlink(sec.rel, primaryRel); err != nil {
+			obs.LogFault(d.octx, err)
+			d.fallbackFetch(ctx, groupID, sec.fileID, sec.rel)
+		}
+	}
+}
+
+// fallbackFetch enqueues fileID/rel as an ordinary needed file when a hardlink
+// secondary could not be linked (§12.4 / R-16). fileID's group has already
+// sent its GROUP_DECISION (this runs well after that, from a different
+// group's decideFile), so the item is pushed straight into the need queue
+// under groupID (the group currently being decided) rather than folded into
+// any GROUP_DECISION.Needed list.
+func (d *decider) fallbackFetch(ctx context.Context, groupID uint32, fileID uint64, rel string) {
+	fm, ok := d.meta.get(fileID)
+	if !ok {
+		obs.Warn(d.octx, "hardlink fallback: no metadata for secondary, counting as failed", obs.F("path", rel))
+		d.counters.FilesFailed.Add(1)
+		return
+	}
+	if warn, ferr := d.guard.reserve(fm.size); warn || ferr != nil {
+		if warn {
+			obs.Warn(d.octx, "destination free space is low", obs.F("group", groupID))
+		}
+		if ferr != nil {
+			obs.LogFault(d.octx, ferr)
+			d.counters.FilesFailed.Add(1)
+			return
+		}
+	}
+	if d.neededBytes != nil {
+		d.neededBytes.Add(fm.size)
+		d.neededFiles.Add(1)
+	}
+	item := needItem{fileID: fileID, groupID: groupID, size: fm.size, rel: rel}
+	if err := d.q.pushGroup(ctx, []needItem{item}); err != nil {
+		obs.LogFault(d.octx, err)
+		d.counters.FilesFailed.Add(1)
+	}
 }
 
 func mtimeEqual(fi fs.FileInfo, e wire.ManifestEntry) bool {

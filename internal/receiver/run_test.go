@@ -15,6 +15,7 @@ import (
 
 	"esync/internal/channel"
 	"esync/internal/crypto/handshake"
+	"esync/internal/fault"
 	"esync/internal/obs"
 	"esync/internal/paircode"
 	"esync/internal/wire"
@@ -51,6 +52,15 @@ type fakeSender struct {
 	// just closes it. Models a sender that crashed or tripped its own watchdog.
 	abortBeforeSummary string
 
+	// lieAboutDigest, when set, makes SESSION_SUMMARY carry a wrong completion
+	// digest, forcing the receiver's own E5005 reconciliation fatal (R-02:
+	// used to check the receiver notifies the sender before exiting).
+	lieAboutDigest bool
+
+	// errRecv collects every *wire.Error this fake sender receives from its
+	// peer on the control channel (R-02: the receiver's own fatal notification).
+	errRecv chan *wire.Error
+
 	mu       sync.Mutex
 	needed   map[uint64]bool
 	served   map[uint64]bool
@@ -75,6 +85,7 @@ func newFakeSender(t *testing.T, files []treeFile, opts ...func(*fakeSender)) *f
 	fs := &fakeSender{
 		t: t, ln: ln, link: code, files: files, errc: make(chan error, 4),
 		needed: map[uint64]bool{}, served: map[uint64]bool{},
+		errRecv: make(chan *wire.Error, 4),
 	}
 	for _, o := range opts {
 		o(fs)
@@ -229,6 +240,11 @@ func (fs *fakeSender) serve(secret obs.Secret) {
 			case *wire.Credit:
 			case *wire.SessionSummaryAck:
 				ackc <- v
+			case *wire.Error:
+				select {
+				case fs.errRecv <- v:
+				default:
+				}
 			}
 		}
 	}()
@@ -305,6 +321,9 @@ func (fs *fakeSender) maybeSummary() {
 		return
 	}
 	comp := fs.completionDigestLocked()
+	if fs.lieAboutDigest {
+		comp[0] ^= 0xff // force the receiver's own E5005 reconciliation fatal
+	}
 	var bytesT uint64
 	for id := range fs.served {
 		bytesT += uint64(len(fs.files[id].data))
@@ -463,4 +482,38 @@ func mkbytes(n int, b byte) []byte {
 		out[i] = b ^ byte(i)
 	}
 	return out
+}
+
+// R-02 (receiver half): on a fatal, the receiver must notify its peer with a
+// *wire.Error on the control channel before exiting (mirroring the sender's
+// own send in sender.Run's finish), instead of just closing the connection
+// and leaving the sender to see a bare EOF it would mistake for a clean end.
+// The fake sender here lies about the completion digest, which forces the
+// receiver's own E5005 reconciliation fatal after everything else succeeded.
+func TestRunNotifiesPeerOnFatal(t *testing.T) {
+	files := []treeFile{{rel: "a.txt", data: []byte("alpha")}}
+	fs := newFakeSender(t, files, func(fs *fakeSender) { fs.lieAboutDigest = true })
+	dest := t.TempDir()
+
+	sum, exit := Run(obs.Ctx{}, Config{
+		Link: fs.link, Dest: dest, Channels: 1, ChannelsPinned: true,
+		HandshakeTimeout: 5 * time.Second, ConnectTimeout: 5 * time.Second,
+		DrainTimeout: 3 * time.Second,
+	})
+
+	if exit == 0 || sum.Outcome == "ok" {
+		t.Fatalf("exit = %d (outcome %s), want non-zero/non-ok: the completion digest was made to mismatch", exit, sum.Outcome)
+	}
+
+	select {
+	case e := <-fs.errRecv:
+		if e.Fatal != 1 {
+			t.Fatalf("ERROR.Fatal = %d, want 1", e.Fatal)
+		}
+		if e.Code != numericCode(fault.E5005) {
+			t.Fatalf("ERROR.Code = %d, want %d (E5005)", e.Code, numericCode(fault.E5005))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sender never received a peer ERROR notification from the receiver's fatal")
+	}
 }

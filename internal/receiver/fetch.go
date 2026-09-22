@@ -53,7 +53,13 @@ func (f *fetcher) loop(ctx context.Context) (lostChannel bool) {
 		case err == nil:
 			f.q.done(it.groupID)
 		case ctx.Err() != nil:
-			f.q.done(it.groupID)
+			// This worker is going away (tuner retirement per §13.4, or session
+			// shutdown) but the item was never fetched. done() would retire an
+			// unfetched file — a silent hole in the destination on an otherwise
+			// exit-0 run — and would count toward waitDrained. Hand it back so a
+			// live worker takes it; if the whole session is ending, the journal
+			// keeps it unresolved and the re-run picks it up.
+			f.q.requeue(it)
 			return false
 		default:
 			var lost channelLost
@@ -67,6 +73,16 @@ func (f *fetcher) loop(ctx context.Context) (lostChannel bool) {
 					obs.F("file", it.fileID), obs.F("chan", int(f.conn.ID())), obs.F("err", lost.Error()))
 				return true
 			}
+			// A desynced error leaves the dead request's unread FILE_CHUNKs on
+			// the wire, so this channel can never serve another request: the
+			// item keeps its normal fate below, but the worker ends afterwards
+			// and registerAndStart rejoins with a fresh CHANNEL_JOIN (§7.3
+			// row 1). Distinct from channelLost, which also discards the item's
+			// attempt count — a persistent local write error must still consume
+			// retries and eventually fail, not rejoin forever.
+			var ds desynced
+			dropChannel := errors.As(err, &ds)
+
 			if fault.IsFatal(err) {
 				f.fail(err)
 				f.q.done(it.groupID)
@@ -79,21 +95,43 @@ func (f *fetcher) loop(ctx context.Context) (lostChannel bool) {
 				select {
 				case <-time.After(fault.Backoff(it.attempt, f.rnd)):
 				case <-ctx.Done():
-					f.q.done(it.groupID)
+					// Cancelled mid-backoff: the retry was already decided and
+					// counted, so consume the attempt and requeue rather than
+					// dropping a file this worker had committed to retrying.
+					it.attempt++
+					f.q.requeue(it)
 					return false
 				}
 				it.attempt++
 				f.q.requeue(it) // re-enters the queue; may be served by another channel
+				if dropChannel {
+					return true
+				}
 				continue
 			}
 			obs.LogFault(f.octx, err)
 			f.counters.FilesFailed.Add(1)
 			f.q.done(it.groupID)
+			if dropChannel {
+				return true
+			}
 		}
 	}
 }
 
-func (f *fetcher) fetchOne(ctx context.Context, it needItem) error {
+func (f *fetcher) fetchOne(ctx context.Context, it needItem) (retErr error) {
+	// streaming is true from the moment the FILE_HEADER lands until a terminal
+	// message for this request is consumed. An error returned in that window
+	// abandons chunks the sender is still writing, so the channel is desynced —
+	// reusing it would read the dead request's tail as the next request's
+	// FILE_HEADER (a bogus E5001 that kills the session).
+	streaming := false
+	defer func() {
+		if retErr != nil && streaming {
+			retErr = desynced{retErr}
+		}
+	}()
+
 	fm, ok := f.meta.get(it.fileID)
 	if !ok {
 		return fault.Newf(fault.E5001, "fetch file", strconv.FormatUint(it.fileID, 10), nil, "no manifest metadata")
@@ -114,6 +152,7 @@ func (f *fetcher) fetchOne(ctx context.Context, it needItem) error {
 	switch v := m.(type) {
 	case *wire.FileHeader:
 		hdr = v
+		streaming = true
 	case *wire.FileError:
 		return faultFromFileError(v)
 	default:
@@ -165,11 +204,16 @@ func (f *fetcher) fetchOne(ctx context.Context, it needItem) error {
 			written += uint64(len(v.Data))
 			f.counters.Bytes.Add(int64(len(v.Data)))
 		case *wire.FileComplete:
+			streaming = false // terminal for this request: the channel is in sync
 			if cerr := part.Close(); cerr != nil {
 				return fault.New(fault.E7004, "close part file", fm.rel, cerr)
 			}
-			return f.finish(it, fm, hdr, v, h, written)
+			return f.finish(ctx, it, fm, hdr, v, h, written)
 		case *wire.FileError:
+			// Also terminal: serve() may emit FILE_ERROR after some chunks
+			// (a mid-read failure or a short read), and the receiver has
+			// consumed every one of them to get here.
+			streaming = false
 			part.Close()
 			return faultFromFileError(v)
 		default:
@@ -179,7 +223,7 @@ func (f *fetcher) fetchOne(ctx context.Context, it needItem) error {
 	}
 }
 
-func (f *fetcher) finish(it needItem, fm fileMeta, hdr *wire.FileHeader, fc *wire.FileComplete, h hash.Hash, written uint64) error {
+func (f *fetcher) finish(ctx context.Context, it needItem, fm fileMeta, hdr *wire.FileHeader, fc *wire.FileComplete, h hash.Hash, written uint64) error {
 	local := h.Sum(nil)
 
 	if written != hdr.Size {
@@ -216,11 +260,7 @@ func (f *fetcher) finish(it needItem, fm fileMeta, hdr *wire.FileHeader, fc *wir
 		}
 	}
 	if fm.hasHLKey {
-		for _, sec := range f.hl.registerMaterialised(it.fileID, fm.rel) {
-			if err := f.dest.MakeHardlink(sec, fm.rel); err != nil {
-				obs.LogFault(f.octx, err) // §12.4: a failed link is a warning, not fatal
-			}
-		}
+		f.linkOrFallback(ctx, it.groupID, fm.rel, f.hl.registerMaterialised(it.fileID, fm.rel))
 	}
 
 	f.counters.FilesTransferred.Add(1)
@@ -230,6 +270,39 @@ func (f *fetcher) finish(it needItem, fm fileMeta, hdr *wire.FileHeader, fc *wir
 	f.onComplete(it.fileID)
 	obs.Trace(f.octx, "file published", obs.F("file", it.fileID), obs.F("path", fm.rel), obs.F("bytes", written))
 	return nil
+}
+
+// linkOrFallback hardlinks each pending secondary to primaryRel, which this
+// fetch just published. If MakeHardlink itself fails, it falls back to
+// fetching that secondary's content as an ordinary needed file (ARCHITECTURE
+// §12.4) instead of leaving it silently absent from the destination (R-16) —
+// the decide-time mirror of this is decider.linkOrFallback.
+func (f *fetcher) linkOrFallback(ctx context.Context, groupID uint32, primaryRel string, pending []pendingLink) {
+	for _, sec := range pending {
+		if err := f.dest.MakeHardlink(sec.rel, primaryRel); err != nil {
+			obs.LogFault(f.octx, err)
+			f.fallbackFetch(ctx, groupID, sec.fileID, sec.rel)
+		}
+	}
+}
+
+// fallbackFetch enqueues fileID/rel as an ordinary needed file when a
+// hardlink secondary could not be linked (§12.4 / R-16). It reuses the
+// existing need queue (respecting its capacity/backpressure) so a fetcher
+// worker — possibly this one, once it loops back to pop — picks it up
+// through the normal request/verify/publish/journal path.
+func (f *fetcher) fallbackFetch(ctx context.Context, groupID uint32, fileID uint64, rel string) {
+	fm, ok := f.meta.get(fileID)
+	if !ok {
+		obs.Warn(f.octx, "hardlink fallback: no metadata for secondary, counting as failed", obs.F("path", rel))
+		f.counters.FilesFailed.Add(1)
+		return
+	}
+	item := needItem{fileID: fileID, groupID: groupID, size: fm.size, rel: rel}
+	if err := f.q.pushFallback(item); err != nil {
+		obs.LogFault(f.octx, err)
+		f.counters.FilesFailed.Add(1)
+	}
 }
 
 // faultFromFileError reconstructs a Fault from a FILE_ERROR. Class and
@@ -262,6 +335,16 @@ type channelLost struct{ cause error }
 
 func (e channelLost) Error() string { return "data channel lost: " + e.cause.Error() }
 func (e channelLost) Unwrap() error { return e.cause }
+
+// desynced marks an error returned while the sender was still streaming this
+// request's FILE_CHUNKs. The unread tail stays on the wire, so the channel
+// cannot serve another request: the worker ends and rejoins (§7.3 row 1). It
+// wraps rather than replaces its cause, so fault.GetCode/IsFatal/IsRetryable
+// still see the underlying code and the item keeps its normal retry budget.
+type desynced struct{ cause error }
+
+func (e desynced) Error() string { return e.cause.Error() + " (data channel desynced mid-stream)" }
+func (e desynced) Unwrap() error { return e.cause }
 
 // transportData classifies a data-channel transport error. EOF, a closed socket
 // and raw net errors (no E-code) mean the connection died: recoverable channel

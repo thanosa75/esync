@@ -351,9 +351,30 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	s := &session{octx: ctx, cfg: cfg, rootCtx: rootCtx, cancel: cancel, cnt: ctx.Counters()}
 
 	var (
-		scComplete *wire.ScanComplete
-		journal    *fsx.Journal
+		scComplete  *wire.ScanComplete
+		journal     *fsx.Journal
+		ctrl        *channel.Conn
+		errNotified bool
 	)
+
+	// notifyPeer best-effort informs the sender why this session is ending
+	// (ARCHITECTURE §14.4 / REQ-ERR-005: "both sides log the same cause"),
+	// mirroring sender.Run's own fatal-notification guard: sent at most once,
+	// skipped for a signal interrupt, and never allowed to block shutdown or
+	// itself become a new fatal.
+	notifyPeer := func(ferr error) {
+		if ctrl == nil || errNotified || errors.Is(ferr, fault.ErrSignal) {
+			return
+		}
+		errNotified = true
+		code := fault.GetCode(ferr)
+		_ = ctrl.SendMsg(&wire.Error{
+			Code:    numericCode(code),
+			Fatal:   1,
+			Message: string(code),
+			Detail:  code.Condition(),
+		})
+	}
 
 	finish := func() (Summary, int) {
 		ferr := s.err()
@@ -365,6 +386,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 			exit, outcome = 5, "signal"
 		case ferr != nil:
 			exit, outcome = fault.ExitCode(ferr), "error"
+			notifyPeer(ferr)
 			obs.LogFault(ctx, ferr)
 		case sum.FilesFailed > 0 || sum.FilesRejected > 0:
 			exit, outcome = 1, "partial"
@@ -433,7 +455,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	sv, _ := sessions.Load(nc)
 	sess := sv.(*handshake.Session)
 
-	ctrl := channel.Control(nc, sess, channel.Receiver)
+	ctrl = channel.Control(nc, sess, channel.Receiver)
 	defer ctrl.Close()
 
 	// 3. SESSION_PARAMS.
