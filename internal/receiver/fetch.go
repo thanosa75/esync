@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,10 +34,16 @@ type fetcher struct {
 	q        *needQueue
 	meta     *metaStore
 	hl       *hardlinkMap
+	guard    *spaceGuard
 	counters *obs.Counters
-	reqID    interface{ Add(uint64) uint64 }
-	rnd      *rand.Rand
-	stall    time.Duration // per-receive ceiling on a data channel; 0 disables
+
+	// Denominators for the progress sink; the hardlink content fallback grows
+	// them when it enqueues work no GROUP_DECISION ever announced.
+	neededBytes *atomic.Int64
+	neededFiles *atomic.Int64
+	reqID       interface{ Add(uint64) uint64 }
+	rnd         *rand.Rand
+	stall       time.Duration // per-receive ceiling on a data channel; 0 disables
 
 	onComplete func(fileID uint64)
 	fail       func(error)
@@ -111,6 +118,16 @@ func (f *fetcher) loop(ctx context.Context) (lostChannel bool) {
 			}
 			obs.LogFault(f.octx, err)
 			f.counters.FilesFailed.Add(1)
+			// A hardlink primary that never lands takes its parked secondaries
+			// with it: they can only be linked to content that now does not
+			// exist, and re-fetching them would pull the same failing file.
+			// Count them so they appear in the summary instead of vanishing
+			// from a run that only admits to one failure (§12.4 / R-16).
+			for _, orphan := range f.hl.abandon(it.fileID) {
+				obs.Warn(f.octx, "hardlink secondary abandoned: its primary failed permanently",
+					obs.F("path", orphan.rel), obs.F("primary", it.fileID))
+				f.counters.FilesFailed.Add(1)
+			}
 			f.q.done(it.groupID)
 			if dropChannel {
 				return true
@@ -260,7 +277,7 @@ func (f *fetcher) finish(ctx context.Context, it needItem, fm fileMeta, hdr *wir
 		}
 	}
 	if fm.hasHLKey {
-		f.linkOrFallback(ctx, it.groupID, fm.rel, f.hl.registerMaterialised(it.fileID, fm.rel))
+		f.linkOrFallback(it.groupID, fm.rel, f.hl.registerMaterialised(it.fileID, fm.rel))
 	}
 
 	f.counters.FilesTransferred.Add(1)
@@ -277,32 +294,25 @@ func (f *fetcher) finish(ctx context.Context, it needItem, fm fileMeta, hdr *wir
 // fetching that secondary's content as an ordinary needed file (ARCHITECTURE
 // §12.4) instead of leaving it silently absent from the destination (R-16) —
 // the decide-time mirror of this is decider.linkOrFallback.
-func (f *fetcher) linkOrFallback(ctx context.Context, groupID uint32, primaryRel string, pending []pendingLink) {
+func (f *fetcher) linkOrFallback(groupID uint32, primaryRel string, pending []pendingLink) {
 	for _, sec := range pending {
 		if err := f.dest.MakeHardlink(sec.rel, primaryRel); err != nil {
 			obs.LogFault(f.octx, err)
-			f.fallbackFetch(ctx, groupID, sec.fileID, sec.rel)
+			f.fallbackFetch(groupID, sec.fileID, sec.rel)
 		}
 	}
 }
 
 // fallbackFetch enqueues fileID/rel as an ordinary needed file when a
 // hardlink secondary could not be linked (§12.4 / R-16). It reuses the
-// existing need queue (respecting its capacity/backpressure) so a fetcher
-// worker — possibly this one, once it loops back to pop — picks it up
-// through the normal request/verify/publish/journal path.
-func (f *fetcher) fallbackFetch(ctx context.Context, groupID uint32, fileID uint64, rel string) {
-	fm, ok := f.meta.get(fileID)
-	if !ok {
-		obs.Warn(f.octx, "hardlink fallback: no metadata for secondary, counting as failed", obs.F("path", rel))
-		f.counters.FilesFailed.Add(1)
-		return
-	}
-	item := needItem{fileID: fileID, groupID: groupID, size: fm.size, rel: rel}
-	if err := f.q.pushFallback(item); err != nil {
-		obs.LogFault(f.octx, err)
-		f.counters.FilesFailed.Add(1)
-	}
+// existing need queue so a fetcher worker — possibly this one, once it loops
+// back to pop — picks it up through the normal request/verify/publish/journal
+// path. See hlFallbackDeps.fetchInstead: this is the same code decide runs.
+func (f *fetcher) fallbackFetch(groupID uint32, fileID uint64, rel string) {
+	hlFallbackDeps{
+		octx: f.octx, meta: f.meta, guard: f.guard, q: f.q,
+		counters: f.counters, neededBytes: f.neededBytes, neededFiles: f.neededFiles,
+	}.fetchInstead(groupID, fileID, rel)
 }
 
 // faultFromFileError reconstructs a Fault from a FILE_ERROR. Class and

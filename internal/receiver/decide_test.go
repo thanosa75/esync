@@ -444,3 +444,70 @@ func TestDecideCreatesDirectory(t *testing.T) {
 	}
 	td.dec.applyDirMeta(obs.Ctx{})
 }
+
+// TestHardlinkClearRetiresTheKey covers the hole the first R-16 fix left. When
+// MakeHardlink fails, decide abandons the key and fetches that entry's content
+// instead. If clear() drops only keyToPath and leaves the seen bit set, every
+// *later* entry sharing the key is parked by claimSecondary on a primary that
+// has already published and will never call registerMaterialised again — so it
+// is never linked, never fetched and never counted, leaving a hole in the
+// destination on an exit-0 run. Three links to one inode plus a single EMLINK
+// or EEXIST is enough to hit it.
+func TestHardlinkClearRetiresTheKey(t *testing.T) {
+	const key = uint64(0xABCD)
+	hl := newHardlinkMap()
+
+	// e1 becomes the primary and publishes.
+	if hl.claimSecondary(key, 1, "one.dat") {
+		t.Fatal("first sighting of a key must not be a secondary")
+	}
+	hl.markPrimary(1, key)
+	if got := hl.registerMaterialised(1, "one.dat"); len(got) != 0 {
+		t.Fatalf("no secondaries were parked, got %v", got)
+	}
+
+	// e2 finds the primary on disk but its link fails, so it abandons the key.
+	if _, ok := hl.pathFor(key); !ok {
+		t.Fatal("primary path should be registered")
+	}
+	if orphans := hl.clear(key); len(orphans) != 0 {
+		t.Fatalf("clear returned %v, want no orphans", orphans)
+	}
+
+	// e3 must now become a fresh primary and be fetched as content — not park
+	// forever waiting on a materialisation that can never come.
+	if hl.claimSecondary(key, 3, "three.dat") {
+		t.Fatal("after clear the key has no live primary, so the next entry must become one and be fetched, not park as a secondary")
+	}
+}
+
+// TestHardlinkAbandonSurfacesOrphanedSecondaries covers the other half of the
+// R-16 gap: when a hardlink primary fails permanently after every retry, it
+// never publishes, so registerMaterialised is never reached and the
+// secondaries parked on its key are left unlinked, unfetched and — the part
+// that matters — uncounted. The run then reports exactly one failure while
+// several files are missing from the destination.
+func TestHardlinkAbandonSurfacesOrphanedSecondaries(t *testing.T) {
+	const key = uint64(0x5151)
+	hl := newHardlinkMap()
+
+	if hl.claimSecondary(key, 1, "primary.dat") {
+		t.Fatal("first sighting of a key must not be a secondary")
+	}
+	hl.markPrimary(1, key)
+	if !hl.claimSecondary(key, 2, "second.dat") || !hl.claimSecondary(key, 3, "third.dat") {
+		t.Fatal("entries sharing a pending primary's key must park as secondaries")
+	}
+
+	orphans := hl.abandon(1)
+	if len(orphans) != 2 {
+		t.Fatalf("abandon returned %d secondaries, want 2: the caller cannot count what it is not handed", len(orphans))
+	}
+	got := map[string]bool{orphans[0].rel: true, orphans[1].rel: true}
+	if !got["second.dat"] || !got["third.dat"] {
+		t.Errorf("abandon returned %v, want second.dat and third.dat", orphans)
+	}
+	if again := hl.abandon(1); len(again) != 0 {
+		t.Errorf("abandon must retire the key; second call returned %v", again)
+	}
+}

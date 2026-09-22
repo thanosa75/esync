@@ -14,13 +14,21 @@ import (
 
 func collectWalk(t *testing.T, cfg walkConfig) ([]plan.Entry, uint32, error) {
 	t.Helper()
+	out, skipped, _, err := collectWalkFull(t, cfg)
+	return out, skipped, err
+}
+
+// collectWalkFull also returns the E6005-only count walkTree reports second —
+// the subset that reaches the exit code (R-23).
+func collectWalkFull(t *testing.T, cfg walkConfig) ([]plan.Entry, uint32, uint32, error) {
+	t.Helper()
 	ch := make(chan plan.Entry, 256)
 	var out []plan.Entry
-	var skipped uint32
+	var skipped, unreadable uint32
 	var werr error
 	done := make(chan struct{})
 	go func() {
-		skipped, werr = walkTree(obs.Ctx{}, cfg, ch)
+		skipped, unreadable, werr = walkTree(obs.Ctx{}, cfg, ch)
 		close(ch)
 		close(done)
 	}()
@@ -29,7 +37,7 @@ func collectWalk(t *testing.T, cfg walkConfig) ([]plan.Entry, uint32, error) {
 	}
 	<-done
 	sort.Slice(out, func(i, j int) bool { return string(out[i].RelPath) < string(out[j].RelPath) })
-	return out, skipped, werr
+	return out, skipped, unreadable, werr
 }
 
 func relPaths(es []plan.Entry) []string {
@@ -171,5 +179,35 @@ func TestWalkMissingRoot(t *testing.T) {
 	_, _, err := collectWalk(t, walkConfig{root: filepath.Join(t.TempDir(), "nope")})
 	if fault.GetCode(err) != fault.E1003 {
 		t.Fatalf("code = %v, want E1003", fault.GetCode(err))
+	}
+}
+
+// TestWalkSkipUnreadableCountIsE6005Only pins the R-23 exit-code boundary.
+// walkTree's second result is what makes a run exit 1, so it must count only
+// unreadable directories (E6005), never the Warn-class skips that §10.1 says
+// are expected: a dangling symlink under --follow-symlinks (E6006), and by the
+// same rule sockets, FIFOs and device nodes. Counting those too made any
+// transfer of a tree holding one socket exit 1 on a byte-perfect run.
+func TestWalkSkipUnreadableCountIsE6005Only(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "real.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "gone"), filepath.Join(root, "dangling")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	out, skipped, unreadable, err := collectWalkFull(t, walkConfig{root: root, followSymlinks: true})
+	if err != nil {
+		t.Fatalf("walkTree: %v", err)
+	}
+	if skipped != 1 {
+		t.Fatalf("skipped = %d, want 1 (the dangling symlink is still reported)", skipped)
+	}
+	if unreadable != 0 {
+		t.Errorf("unreadable = %d, want 0: a dangling symlink is Warn class (E6006) and §14.6 keeps Warn out of the exit code", unreadable)
+	}
+	if got := relPaths(out); len(got) != 1 || got[0] != "real.txt" {
+		t.Errorf("entries = %v, want [real.txt]", got)
 	}
 }

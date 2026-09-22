@@ -75,6 +75,9 @@ type fetchHarness struct {
 	done    []uint64
 	doneMu  sync.Mutex
 	failErr atomic.Value
+
+	neededBytes atomic.Int64
+	neededFiles atomic.Int64
 }
 
 func newFetchHarness(t *testing.T, rConn *channel.Conn) *fetchHarness {
@@ -93,18 +96,20 @@ func newFetchHarness(t *testing.T, rConn *channel.Conn) *fetchHarness {
 
 	h := &fetchHarness{q: newNeedQueue(needQueueDepth), cnt: &obs.Counters{}, dir: dir, dest: dest, journal: j}
 	h.f = &fetcher{
-		octx:     obs.Ctx{},
-		cfg:      Config{}.withDefaults(),
-		conn:     rConn,
-		dest:     dest,
-		journal:  j,
-		algo:     digest.MD5,
-		q:        h.q,
-		meta:     newMetaStore(),
-		hl:       newHardlinkMap(),
-		counters: h.cnt,
-		reqID:    &atomic.Uint64{},
-		rnd:      nil,
+		neededBytes: &h.neededBytes,
+		neededFiles: &h.neededFiles,
+		octx:        obs.Ctx{},
+		cfg:         Config{}.withDefaults(),
+		conn:        rConn,
+		dest:        dest,
+		journal:     j,
+		algo:        digest.MD5,
+		q:           h.q,
+		meta:        newMetaStore(),
+		hl:          newHardlinkMap(),
+		counters:    h.cnt,
+		reqID:       &atomic.Uint64{},
+		rnd:         nil,
 		onComplete: func(id uint64) {
 			h.doneMu.Lock()
 			h.done = append(h.done, id)
@@ -276,13 +281,20 @@ func TestFetchHardlinkFallsBackToContentOnLinkFailure(t *testing.T) {
 
 	go serveRequests(t, sConn, map[uint64]*stubFile{1: {data: secData, dig: secDig}})
 
+	// The queue is closed FIRST, which is the production ordering: run.go
+	// closes it as soon as decide finishes, and decide runs far ahead of fetch
+	// (MFR-0004). A fallback enqueued after that point must still be served —
+	// asserting it here is what catches a pushFallback that refuses a closed
+	// queue and quietly turns the secondary into a FilesFailed count with no
+	// file on disk.
+	h.q.close()
+
 	// Simulate what finish() does once a hardlink primary publishes: link its
 	// parked secondaries, or fall back. "does-not-exist-primary.dat" was never
 	// published, so MakeHardlink fails.
-	h.f.linkOrFallback(context.Background(), 0, "does-not-exist-primary.dat",
+	h.f.linkOrFallback(0, "does-not-exist-primary.dat",
 		[]pendingLink{{fileID: 1, rel: "second.dat"}})
 
-	h.q.close()
 	h.f.loop(context.Background())
 
 	if e := h.failErr.Load(); e != nil {
@@ -294,6 +306,17 @@ func TestFetchHardlinkFallsBackToContentOnLinkFailure(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(h.dir, "second.dat"))
 	if err != nil || string(got) != string(secData) {
 		t.Fatalf("second.dat must be fetched as ordinary content when the link fails: got %q, err %v", got, err)
+	}
+	// The fallback enqueues work no GROUP_DECISION ever announced, so it must
+	// also grow the progress denominator — otherwise its bytes land in the
+	// numerator alone and the progress bar runs past 100%. The decide-side
+	// mirror of this fallback always did; the fetch side did not until both
+	// were routed through hlFallbackDeps.fetchInstead.
+	if got := h.neededFiles.Load(); got != 1 {
+		t.Errorf("neededFiles = %d, want 1: the fallback must count toward the progress denominator", got)
+	}
+	if got := h.neededBytes.Load(); got != int64(len(secData)) {
+		t.Errorf("neededBytes = %d, want %d", got, len(secData))
 	}
 }
 

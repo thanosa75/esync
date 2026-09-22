@@ -213,14 +213,20 @@ MFR-0017 · plan/wire/record · Any control message assembled from an UNBOUNDED
   break waiting to happen.
 
 MFR-0018 · receiver/hardlink · A hard-link secondary must NEVER depend solely on
-  its primary publishing. Secondaries were parked until the primary published, so
-  a primary resolved by SKIP left them parked forever — absent from the
-  destination, journal clean, exit 0. A failed link was likewise warn-only. Every
-  path that resolves a primary must materialise its parked secondaries, and any
-  link failure must fall back to fetching the secondary's content (§12.4 /
-  REQ-FS-003), with a FilesFailed increment as the last-resort safety net. The
-  rule generalises: warn-only is never an acceptable outcome for a file the plan
-  says belongs in the destination.
+  its primary publishing. Secondaries park until the primary resolves, so EVERY
+  terminal outcome of a primary has to drain that parked list, not just the happy
+  one. Four ways to leave the list stranded, all found here: primary resolved by
+  SKIP (never publishes); link failure treated as warn-only; `clear()` on a failed
+  link dropping the path but leaving the `seen` bit, so later entries park on a
+  primary that already published and will never register again; primary failing
+  permanently after retries, so nothing drains the list and the summary admits to
+  one failure while several files are missing. A link failure falls back to
+  fetching the secondary's content (§12.4 / REQ-FS-003); an unfetchable one is
+  counted FilesFailed. The rule generalises: warn-only, or silently uncounted, is
+  never an acceptable outcome for a file the plan says belongs in the destination.
+  Two mirrored fallback paths exist (decide-side and fetch-side) — keep them on
+  ONE implementation. Written twice, they drifted: only one reserved free space
+  (§12.7) and only one grew the progress denominator.
 
 MFR-0019 · receiver/queue · NEVER call a capacity-blocking push from the
   goroutine that pops the queue. The hard-link content fallback (MFR-0018) first
@@ -231,15 +237,24 @@ MFR-0019 · receiver/queue · NEVER call a capacity-blocking push from the
   a session that was not). Enqueue paths reachable from a worker use
   `pushFallback`, which never blocks and overshoots capacity by a bounded amount.
   Blocking backpressure is correct only on the decide side, which is not a popper.
+  `pushFallback` must also ACCEPT on a closed queue: close means only "no new
+  groups", and run.go closes as soon as decide finishes — which is ~20 min ahead
+  of fetch (MFR-0004). Refusing there made the fallback inert for the normal case.
+  It is safe because every caller still holds an item in flight, so pop cannot
+  have returned ok=false yet.
 
 MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must be
-  threaded to the exit decision, not just into a progress message. Walk-skipped
-  entries (E6005/6/7) were counted by the walker and reported in SCAN_COMPLETE,
-  then dropped: they never reached SESSION_SUMMARY and the exit switch keyed on
-  failures alone, so an unreadable subtree exited 0. REQ-SCAN-032 / §14.6. When
-  testing an exit code, assert the *reason* too (here: outcome "partial" with
-  FilesFailed == 0), or a failure-driven exit 1 will masquerade as the case under
-  test.
+  threaded to the exit decision — and must count only what actually justifies a
+  non-zero exit. §14.6: Warn class never affects the exit code, so of the three
+  walk skips only E6005 (unreadable directory = source content possibly missing)
+  qualifies; E6006 (sockets, FIFOs, device nodes — "expected", never transferred)
+  and E6007 (symlink cycle) do not. The original bug: the walker counted all
+  three, reported them in SCAN_COMPLETE, then dropped them — they never reached
+  SESSION_SUMMARY and the exit switch keyed on failures alone, so an unreadable
+  subtree exited 0 (REQ-SCAN-032). The over-correction: counting all three made
+  any tree holding one socket exit 1 on a byte-perfect run. When testing an exit
+  code, assert the *reason* too (outcome "partial" with FilesFailed == 0), or a
+  failure-driven exit 1 masquerades as the case under test.
 
 ## Session Log
 
@@ -249,22 +264,17 @@ MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must 
   partitioned by strict file ownership, then reviewed by an Opus pass.
   MFR-0016..0020 record the five that are bug *rules*; R-22 (--version reports
   the wire protocol) and R-19 (--compact-code) are feature gaps, not rules.
-- Two new findings surfaced from the fixes themselves and are in
-  STATUS_SUMMARY.md: **R-42**, a drain deadlock the R-16 fallback introduced
-  (fixed here, MFR-0019); **R-43**, a test-only mutable global A4 added to
-  cli.go, refactored away into a pure `senderConfig(args)` builder — the
-  resulting test is strictly stronger, since an unregistered flag now surfaces
-  as a usage exit instead of being silently ignored.
-- Process note that paid off twice: require every fix to carry a test proven to
-  FAIL on the pre-fix tree, and capture that failure verbatim. It caught R-42
-  (routing pushFallback back through pushGroup hangs the test at its 2s guard)
-  and the R-43 seam. Decline to fabricate a proof only when the behaviour did
-  not exist in any form before (TestCompactEndpoints).
-- Remaining work, ROI-ordered, is in `ROI-fixes-Review-20260922.md`: Tier A
-  highest ROI (CI gap R-01, key zeroing R-21, statfs fail-open, drain watchdog,
-  failed-item list R-08, dry-run writes R-10), Tier B real bugs (`.esync`
-  case-fold is the last data-destruction path), Tier C doc integrity, Tier D
-  deferred features, plus six owner decisions.
+- **Six defects came out of the fixes themselves** (R-42..R-47 in
+  STATUS_SUMMARY.md), four of them in the R-16 hardlink work alone. Sobering
+  ratio: a seven-fix pass introduced almost one new bug per fix, and three
+  would have silently lost files. The Opus review that found the last four was
+  the highest-value step of the pass — budget one on any multi-agent change.
+- Process notes that paid off: every fix carries a test proven to FAIL on the
+  pre-fix tree, captured verbatim (this caught R-42 and R-43 directly). And a
+  test must reproduce the PRODUCTION ordering — the first hardlink-fallback test
+  passed only because it enqueued before `q.close()`, which run.go never does.
+- Remaining work is ROI-ordered in `ROI-fixes-Review-20260922.md` (Tier A/B/C/D
+  plus the owner decisions blocking it).
 
 ### 2026-09-22 — bug-hunt tier 1 (condensed)
 
@@ -274,14 +284,12 @@ MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must 
   unbounded CHANNEL_JOIN read (MFR-0012), `serve()` reopen-by-path TOCTOU
   (MFR-0013), digest-cache ctime granularity (MFR-0015, a spec erratum).
 - All five were invisible to the suite; every new test was proven to fail on the
-  pre-fix tree. The `serve` test's pre-fix failure is a `FILE_HEADER` — direct
-  evidence the outside file was already being streamed.
-- Two reusable test levers found here: a stub server that cancels *before*
-  answering (no sleep race, since the fetcher is parked in the receive), and
-  occupying `.esync/parts/<id>.part` with a **directory** to force a
-  deterministic mid-stream EISDIR → E7001 (item-class, retryable) without any
-  I/O fault injection.
-- Gate: `make ci` green, coverage 85.4 % (from 84.7 %).
+  pre-fix tree (the `serve` test's pre-fix failure is a `FILE_HEADER` — direct
+  evidence the outside file was already being streamed).
+- Two reusable test levers: a stub server that cancels *before* answering (no
+  sleep race, since the fetcher is parked in the receive), and occupying
+  `.esync/parts/<id>.part` with a **directory** to force a deterministic
+  mid-stream EISDIR → E7001 (item-class, retryable) with no fault injection.
 
 ### 2026-09-08 — audit-driven hardening (condensed)
 
@@ -309,45 +317,38 @@ MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must 
 
 ### 2026-09-08 — Ctrl-C not handled: signal force-exit backstop (MFR-0008, condensed)
 
-- Operator: "ctrl-c does not get handled; I have to kill the processes and get
-  <defunct> in linux."
+- Operator: "ctrl-c does not get handled; I have to kill the processes."
 - Root cause: both `Run`s `signal.Notify` SIGINT+SIGTERM and cancel gracefully on
   the first, which traps every later signal too (and SIGTERM, so plain `kill` is
   inert). `--shutdown-grace` had been a parsed-only flag since 2026-09-04.
 - Fix (`cli.go`): `signalEscape` parks until the first signal (Run owns that
   one), then exits 5 on a second signal or on grace elapsing; wired into both run
-  paths. Also `receiver/run.go`: `signal.watch` now closes the control conn after
+  paths. Also `receiver/run.go`: `signal.watch` closes the control conn after
   `s.fail(ErrSignal)`, because `control.reader` blocks in `ctrl.RecvMsg()` with no
-  rootCtx awareness and previously waited out the full 5 s worker grace on every
-  Ctrl-C.
+  rootCtx awareness and previously waited out the full 5 s worker grace.
 - Tests: `cli_test.go` `TestSignalEscape{SecondSignal,GraceTimeout,NoSignal}`.
 
 ### 2026-09-07 — grouping + reliability bundle (condensed)
 
 - One bundled batch from four operator complaints after a failed ~43GB resume,
   carrying a **protocol version bump 1→2** (handshake, wire, plan digest,
-  journal `sessionInfo`): v1 journals are invalidated and cross-version pairing
+  journal `sessionInfo`): v1 journals invalidated, cross-version pairing
   rejected — the operator accepted this.
 - (1) `obs.Progress` was never instantiated by either run path (MFR-0007);
-  added `Progress.Feed`, a smoothed rate + eta, and wiring in both `Run`s.
-  Receiver total is a running sum from `decideGroup` (needed entries only);
-  the sender renders sent-only, as it cannot know receiver skips.
+  added `Progress.Feed`, smoothed rate + eta, wiring in both `Run`s. Receiver
+  total is a running sum from `decideGroup` (needed entries only); the sender
+  renders sent-only, as it cannot know receiver skips.
 - (2) Bogus E9002: control-loss before SESSION_SUMMARY is now a failure, and
   **stall detection (MFR-0005)** arrived as `Conn.RecvMsgTimeout(d)` +
-  `--stall-timeout` (default 60s) on both data-channel receives. This also
-  fixed (3), the half-written journal that broke clean re-runs.
+  `--stall-timeout` (60s) on both data-channel receives. This also fixed (3),
+  the half-written journal that broke clean re-runs.
 - (4) Size-based grouping (MFR-0006): `computeGroups` opens a new group at
-  ≥1024 entries or when `--group-bytes` (default 512 MiB) would be exceeded;
-  oversize single file = its own group, entries never split.
-  `SessionParams.GroupSize u32` → `GroupBytes u64` (advisory), digest slot
-  literal `0`, `--group-bytes` deliberately NOT folded into the plan digest.
-- FILE_CANCEL was considered here and deliberately **WONTFIX** as
-  disproportionate — see MFR-0014, where its absence turned out to matter.
-
-### 2026-09-07 — sender E9002 drain watchdog: deadline → inactivity
-- Fully captured by MFR-0004: a 43GB/176k-file run died E9002 with 13GB sent
-  because the watchdog armed on `allDecidedCh` while decide ran ~20 min ahead of
-  fetch. Fixed by sampling `tracker.progress` instead.
+  ≥1024 entries or when `--group-bytes` (512 MiB) would be exceeded; oversize
+  single file = its own group, entries never split. `SessionParams.GroupSize
+  u32` → `GroupBytes u64` (advisory), digest slot literal `0`; `--group-bytes`
+  deliberately NOT folded into the plan digest.
+- FILE_CANCEL considered here and deliberately **WONTFIX** as disproportionate
+  — see MFR-0014, where its absence turned out to matter.
 
 ### 2026-09-07 — 60s groups/channels/bandwidth heartbeat (condensed)
 
@@ -355,14 +356,15 @@ MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must 
   `groups=… channels=… rate=…` at INFO every 60s. `Stop()` is synchronous (a
   `done` channel the loop closes) so callers can read shared state afterwards
   without a `-race` hazard. Group ids: `needQueue.pending` (receiver, hence
-  `done(groupID)`) and `tracker.inProgressGroups()` (sender); channels from a
-  new `activeChannels atomic.Int64`.
+  `done(groupID)`) and `tracker.inProgressGroups()` (sender).
 
-### 2026-09-07 — Fix: receiver drain watchdog fires mid-transfer (E9002)
-- Fully captured by MFR-0003: the receiver armed `DrainTimeout +
-  workerStopGrace` from pipeline launch, killing any fetch phase longer than
-  60s. Fixed by arming only once termination is reachable (`decideWg.Wait()` /
-  `q.close()` / `q.waitDrained()`), with `waitGrace` bounding the unwind.
+### 2026-09-07 — both drain watchdogs (E9002), fully captured by MFR-0003/0004
+- Receiver: armed `DrainTimeout + workerStopGrace` from pipeline launch, killing
+  any fetch phase over 60s. Fixed by arming only once termination is reachable
+  (`decideWg.Wait()` / `q.close()` / `q.waitDrained()`), `waitGrace` bounding
+  the unwind. Sender: a 43GB run died E9002 with 13GB sent because the watchdog
+  armed on `allDecidedCh` while decide ran ~20 min ahead of fetch; fixed by
+  sampling `tracker.progress` instead.
 
 ### 2026-09-04 — Adaptive channel tuner (REQ-PAR-004) + sender-side dynamic join (condensed)
 
@@ -378,23 +380,20 @@ MFR-0020 · sender/run · A count that is supposed to affect the EXIT CODE must 
   MFR-0002. Sender keeps its listener open and accepts late CHANNEL_JOINs up to
   `cfg.MaxChannels` in a `join.accept` goroutine, or ramp-up is a no-op against
   a real sender.
-- Caveat retained: which channel `retireOne` picks and whether a ramp-down
-  counts as "unproductive" are my reading of an underspecified §13.4 pseudocode
-  (ramp-up resets the streak, ramp-down advances it) — worth a sanity-check if
-  real-world tuning ever looks wrong.
-- Test-harness note: `fakeSender` has a late-join accept loop
-  (`joinedCount()`) and `chunkDelay`/`chunkSize` pacing so a transfer can span
-  several tuning windows cheaply; pre-existing E2E tests now pass
-  `ChannelsPinned: true` (unpinned silently ignored their `Channels:` value).
+- Caveat retained: which channel `retireOne` picks, and whether a ramp-down
+  counts as "unproductive", are my reading of an underspecified §13.4 pseudocode
+  (ramp-up resets the streak, ramp-down advances it) — sanity-check if real
+  tuning ever looks wrong.
+- Test-harness note: `fakeSender` has a late-join accept loop (`joinedCount()`)
+  and `chunkDelay`/`chunkSize` pacing so a transfer spans several tuning windows
+  cheaply; pre-existing E2E tests pass `ChannelsPinned: true` (unpinned silently
+  ignored their `Channels:` value).
 
 ### 2026-09-04 — earlier sessions (pruned)
 
-- Entries for the initial vertical-slice implementation, the `internal/receiver`
-  package build, and the CLI-wiring/E2E/coverage-gate session were pruned to keep
-  this file under 400 lines. Their MFRs (MFR-0001) and follow-ups are retained
-  above / below. See git history for detail.
-- Retained from the CLI-wiring session: `cover-check` passes `-coverpkg=./...` so
-  the root e2e test's coverage spreads to every package it exercises (hence low
-  isolated per-package numbers for `sender`/`channel`/root but a passing total).
-  Test-harness trap: a test driving both `Run`s in one process MUST give each its
-  own `obs.Init` — a shared `obs.Ctx` double-counts via the live `obs.Counters`.
+- The initial vertical-slice, `internal/receiver` build, and CLI-wiring/E2E
+  sessions were pruned for the 400-line cap; MFRs retained above, see git log.
+- Retained: `cover-check` passes `-coverpkg=./...` so the root e2e test's
+  coverage spreads to every package it exercises (hence low isolated per-package
+  numbers for `sender`/`channel`/root but a passing total). Test-harness trap: a
+  test driving both `Run`s in one process MUST give each its own `obs.Init`.

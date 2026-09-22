@@ -120,18 +120,52 @@ func (h *hardlinkMap) markPrimary(fileID, key uint64) {
 	h.mu.Unlock()
 }
 
-// clear abandons a key (its link() failed): the primary content is fetched
-// normally instead (§12.4).
-func (h *hardlinkMap) clear(key uint64) {
+// clear abandons a key whose link() failed: this entry's content is fetched
+// normally instead (§12.4). It retires the key completely — path, seen bit and
+// any still-parked secondaries — and returns those secondaries so the caller
+// can fall them back to content too.
+//
+// Dropping only keyToPath, which the first version of this did, silently lost
+// files: with the seen bit left set and the path gone, claimSecondary parked
+// every later entry sharing the key on a primary that had already published
+// and would never call registerMaterialised again. Three or more links to one
+// inode plus a single EMLINK/EEXIST was enough to leave a hole in the
+// destination on an exit-0 run — the R-16 symptom this fix exists to remove.
+func (h *hardlinkMap) clear(key uint64) []pendingLink {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	delete(h.keyToPath, key)
-	h.mu.Unlock()
+	delete(h.seen, key)
+	orphans := h.pending[key]
+	delete(h.pending, key)
+	return orphans
 }
 
 // registerMaterialised is called once fileID's content is known-correct at rel
 // — either fetch publishing it, or decide finding it already resolved by a
 // SKIP (R-16) — and returns the secondaries that were waiting on this file's
 // key so the caller can hardlink them to rel.
+// abandon retires fileID's key because fileID itself will never be
+// materialised — its content failed permanently after every retry. It returns
+// the secondaries that were parked on that key so the caller can account for
+// them, because nothing else ever will: registerMaterialised is only reached
+// from a successful publish, so without this they stay unlinked, unfetched and
+// — worse — uncounted, disappearing from a run whose summary says nothing
+// about them.
+func (h *hardlinkMap) abandon(fileID uint64) []pendingLink {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	key, ok := h.fileKey[fileID]
+	if !ok {
+		return nil
+	}
+	orphans := h.pending[key]
+	delete(h.pending, key)
+	delete(h.keyToPath, key)
+	delete(h.seen, key)
+	return orphans
+}
+
 func (h *hardlinkMap) registerMaterialised(fileID uint64, rel string) []pendingLink {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -380,8 +414,15 @@ func (d *decider) decideFile(ctx context.Context, groupID uint32, rel string, fi
 			if err := d.dest.MakeHardlink(rel, p); err == nil {
 				return false
 			} else {
+				// §12.4: fall back to fetching the content. This entry takes
+				// over as the key's primary, so later entries sharing it link
+				// to this copy instead of parking forever on the old one.
 				obs.LogFault(d.octx, err)
-				d.hl.clear(key) // §12.4: fall back to fetching the content
+				for _, orphan := range d.hl.clear(key) {
+					d.fallbackFetch(groupID, orphan.fileID, orphan.rel)
+				}
+				d.hl.markPrimary(fileID, key)
+				isPrimary = true
 			}
 		} else if d.hl.claimSecondary(key, fileID, rel) {
 			// A primary is pending; fetch will create this link once it lands,
@@ -402,7 +443,7 @@ func (d *decider) decideFile(ctx context.Context, groupID uint32, rel string, fi
 	// destination forever. Materialise them now against the already-present
 	// rel.
 	if isPrimary && !need && !d.dryRun {
-		d.linkOrFallback(ctx, groupID, rel, d.hl.registerMaterialised(fileID, rel))
+		d.linkOrFallback(groupID, rel, d.hl.registerMaterialised(fileID, rel))
 	}
 	return need
 }
@@ -442,11 +483,11 @@ func (d *decider) decideFileContent(rel string, e wire.ManifestEntry) bool {
 // known-correct content). If MakeHardlink itself fails, it falls back to
 // fetching that secondary's content as an ordinary needed file (ARCHITECTURE
 // §12.4) instead of leaving it silently absent from the destination (R-16).
-func (d *decider) linkOrFallback(ctx context.Context, groupID uint32, primaryRel string, pending []pendingLink) {
+func (d *decider) linkOrFallback(groupID uint32, primaryRel string, pending []pendingLink) {
 	for _, sec := range pending {
 		if err := d.dest.MakeHardlink(sec.rel, primaryRel); err != nil {
 			obs.LogFault(d.octx, err)
-			d.fallbackFetch(ctx, groupID, sec.fileID, sec.rel)
+			d.fallbackFetch(groupID, sec.fileID, sec.rel)
 		}
 	}
 }
@@ -457,31 +498,14 @@ func (d *decider) linkOrFallback(ctx context.Context, groupID uint32, primaryRel
 // group's decideFile), so the item is pushed straight into the need queue
 // under groupID (the group currently being decided) rather than folded into
 // any GROUP_DECISION.Needed list.
-func (d *decider) fallbackFetch(ctx context.Context, groupID uint32, fileID uint64, rel string) {
-	fm, ok := d.meta.get(fileID)
-	if !ok {
-		obs.Warn(d.octx, "hardlink fallback: no metadata for secondary, counting as failed", obs.F("path", rel))
-		d.counters.FilesFailed.Add(1)
-		return
-	}
-	if warn, ferr := d.guard.reserve(fm.size); warn || ferr != nil {
-		if warn {
-			obs.Warn(d.octx, "destination free space is low", obs.F("group", groupID))
-		}
-		if ferr != nil {
-			obs.LogFault(d.octx, ferr)
-			d.counters.FilesFailed.Add(1)
-			return
-		}
-	}
-	if d.neededBytes != nil {
-		d.neededBytes.Add(fm.size)
-		d.neededFiles.Add(1)
-	}
-	item := needItem{fileID: fileID, groupID: groupID, size: fm.size, rel: rel}
-	if err := d.q.pushGroup(ctx, []needItem{item}); err != nil {
-		obs.LogFault(d.octx, err)
-		d.counters.FilesFailed.Add(1)
+func (d *decider) fallbackFetch(groupID uint32, fileID uint64, rel string) {
+	d.fallbackDeps().fetchInstead(groupID, fileID, rel)
+}
+
+func (d *decider) fallbackDeps() hlFallbackDeps {
+	return hlFallbackDeps{
+		octx: d.octx, meta: d.meta, guard: d.guard, q: d.q,
+		counters: d.counters, neededBytes: d.neededBytes, neededFiles: d.neededFiles,
 	}
 }
 

@@ -27,18 +27,31 @@ type walker struct {
 	rootDev uint64
 	visited map[[2]uint64]bool // (dev,ino) of followed symlink dirs, for cycle detection
 	skipped uint32             // E6005/E6006/E6007 warn-and-skip count -> SCAN_COMPLETE.skipped_entries
+
+	// unreadable counts only E6005 (a directory the walker could not read), the
+	// subset of skipped that means "source content may be missing from this
+	// transfer" and so must reach the exit code (R-23). The other two are not:
+	// E6006 covers sockets, FIFOs and device nodes, which §10.1 never transfers
+	// by design — E6006's own advice says "expected" — and E6007 is a symlink
+	// cycle the walker correctly declines to descend twice. Both are Warn class,
+	// and §14.6 is explicit that Warn does not affect the exit code. Folding
+	// them in made `esync ~/` exit 1 on a byte-perfect run because some runtime
+	// directory held a socket.
+	unreadable uint32
 }
 
 // walkTree enumerates the source tree depth-first (ARCHITECTURE §10.1). It hashes
-// nothing. It returns the count of entries skipped with a warning, and a fatal
-// fault only when the root itself is unusable.
-func walkTree(ctx obs.Ctx, cfg walkConfig, out chan<- plan.Entry) (skipped uint32, err error) {
+// nothing. It returns the count of entries skipped with a warning, how many of
+// those were unreadable directories (E6005 — the only skip class that affects
+// the exit code, see walker.unreadable), and a fatal fault only when the root
+// itself is unusable.
+func walkTree(ctx obs.Ctx, cfg walkConfig, out chan<- plan.Entry) (skipped, unreadable uint32, err error) {
 	fi, lerr := os.Lstat(cfg.root)
 	if lerr != nil {
 		if errors.Is(lerr, fs.ErrNotExist) {
-			return 0, fault.Wrap(fault.E1003, "stat source", cfg.root, lerr)
+			return 0, 0, fault.Wrap(fault.E1003, "stat source", cfg.root, lerr)
 		}
-		return 0, fault.Wrap(fault.E1004, "stat source", cfg.root, lerr)
+		return 0, 0, fault.Wrap(fault.E1004, "stat source", cfg.root, lerr)
 	}
 	dev, _, _ := sysStat(fi)
 	w := &walker{ctx: ctx, cfg: cfg, out: out, rootDev: dev, visited: map[[2]uint64]bool{}}
@@ -51,15 +64,16 @@ func walkTree(ctx obs.Ctx, cfg walkConfig, out chan<- plan.Entry) (skipped uint3
 	case fi.Mode()&os.ModeSymlink != 0:
 		w.handleSymlink(fi, cfg.root, filepath.Base(cfg.root))
 	default:
-		return 0, fault.New(fault.E1004, "stat source", cfg.root, nil)
+		return 0, 0, fault.New(fault.E1004, "stat source", cfg.root, nil)
 	}
-	return w.skipped, nil
+	return w.skipped, w.unreadable, nil
 }
 
 func (w *walker) walkDir(abs, rel string) {
 	des, err := os.ReadDir(abs)
 	if err != nil {
 		w.skipped++
+		w.unreadable++
 		obs.Warn(w.ctx, "source directory unreadable, skipping",
 			obs.F("code", string(fault.E6005)), obs.F("path", abs), obs.F("action", fault.E6005.Action()))
 		return

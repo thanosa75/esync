@@ -82,6 +82,7 @@ type session struct {
 	q       *needQueue
 	meta    *metaStore
 	hl      *hardlinkMap
+	guard   *spaceGuard
 }
 
 // chanWorker is one live data-channel connection plus the cancel func that
@@ -163,16 +164,21 @@ func (s *session) dialOneData(octx obs.Ctx, id uint8) (*channel.Conn, error) {
 // and every channel the tuner opens later.
 func (s *session) newFetcher(octx obs.Ctx, conn *channel.Conn) *fetcher {
 	return &fetcher{
-		octx:       octx,
-		cfg:        s.cfg,
-		conn:       conn,
-		dest:       s.dest,
-		journal:    s.journal,
-		algo:       s.algo,
-		q:          s.q,
-		meta:       s.meta,
-		hl:         s.hl,
-		counters:   s.cnt,
+		octx:     octx,
+		cfg:      s.cfg,
+		conn:     conn,
+		dest:     s.dest,
+		journal:  s.journal,
+		algo:     s.algo,
+		q:        s.q,
+		meta:     s.meta,
+		hl:       s.hl,
+		guard:    s.guard,
+		counters: s.cnt,
+
+		neededBytes: &s.neededBytes,
+		neededFiles: &s.neededFiles,
+
 		reqID:      &s.reqID,
 		rnd:        rand.New(rand.NewSource(int64(conn.ID())*7919 + time.Now().UnixNano())),
 		stall:      s.cfg.StallTimeout,
@@ -648,7 +654,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	hl := newHardlinkMap()
 	destPlat := fsx.Platform(platformID())
 
-	s.dest, s.journal, s.algo, s.q, s.meta, s.hl = dest, journal, algo, q, meta, hl
+	s.dest, s.journal, s.algo, s.q, s.meta, s.hl, s.guard = dest, journal, algo, q, meta, hl, guard
 
 	dec := &decider{
 		octx:        octx,

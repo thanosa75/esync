@@ -45,12 +45,15 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	// clean shutdown.
 	var ctrl *channel.Conn
 	var errNotified bool
-	// walkSkipped is set once the walker finishes (step 9); finish reads it here
-	// (rather than through Summary, whose FilesSkipped already means something
-	// else — see R-23) so an unreadable subtree the walker warned-and-skipped
-	// (E6005/E6006/E6007) still yields a non-zero exit even though it never
-	// reached the receiver and so never became a FilesFailed count.
-	var walkSkipped uint32
+	// Both are set once the walker finishes (step 9). finish reads them here
+	// rather than through Summary, whose FilesSkipped already means something
+	// else (R-23). walkSkipped is every warn-and-skip (E6005/6/7) and only
+	// feeds the reported counts; walkUnreadable is the E6005 subset — source
+	// content that may be missing from this transfer — and is what makes the
+	// run exit 1, since it never reached the receiver and so never became a
+	// FilesFailed count. Sockets and symlink cycles are Warn class and §14.6
+	// keeps Warn out of the exit code, so they deliberately do not count here.
+	var walkSkipped, walkUnreadable uint32
 	finish := func(sum Summary) (Summary, int) {
 		var ferr error
 		if v := fatal.Load(); v != nil {
@@ -71,7 +74,7 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 				})
 			}
 			obs.LogFault(ctx, ferr)
-		case sum.FilesFailed > 0 || walkSkipped > 0:
+		case sum.FilesFailed > 0 || walkUnreadable > 0:
 			exit, outcome = 1, "partial"
 		}
 		sum.Elapsed = time.Since(start)
@@ -215,13 +218,13 @@ func Run(ctx obs.Ctx, cfg Config) (Summary, int) {
 	var walkErr error
 	scanEnd := obs.Start(ctx, "scan")
 	obs.Go(octx, "walker", func() error {
-		s, e := walkTree(octx, walkConfig{
+		s, u, e := walkTree(octx, walkConfig{
 			root:           absRoot,
 			followSymlinks: cfg.FollowSymlinks,
 			oneFileSystem:  cfg.OneFileSystem,
 			hardlinks:      cfg.Hardlinks,
 		}, entriesCh)
-		walkSkipped, walkErr = s, e
+		walkSkipped, walkUnreadable, walkErr = s, u, e
 		close(entriesCh)
 		return nil
 	})

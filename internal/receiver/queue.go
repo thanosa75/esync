@@ -19,7 +19,8 @@ type needItem struct {
 // §13.6). Groups are appended in ascending order; within a group items are
 // ordered largest-first. It never drops an item and never yields the same item
 // twice [P-QUEUE-01]. pushGroup never exceeds its capacity; pushFallback may
-// overshoot it by a bounded amount (see there). pushGroup blocks while the
+// overshoot it by a bounded amount and may push after close (see there).
+// pushGroup blocks while the
 // queue is full, which is the backpressure that stops the decide pool emitting
 // CREDIT (§13.5).
 type needQueue struct {
@@ -97,24 +98,31 @@ func (q *needQueue) requeue(it needItem) {
 
 // pushFallback enqueues a single item that was never part of any
 // GROUP_DECISION: a hardlink secondary whose link failed and must be fetched
-// as content instead (§12.4 / R-16). Unlike pushGroup it never blocks on
-// capacity, because it is called from a fetcher worker — the same goroutine
-// that pops. Waiting for a slot there can deadlock the whole drain: with the
-// queue full and every worker parked here, no one is left to pop, so no slot
-// can ever free and the session hangs until the drain watchdog fires a
-// misleading E9002. The resulting overshoot is bounded by the number of
-// hardlink secondaries whose link failed, never by the plan size.
-func (q *needQueue) pushFallback(it needItem) error {
+// as content instead (§12.4 / R-16). It differs from pushGroup in two ways,
+// both deliberate.
+//
+// It never blocks on capacity, because it can be called from a fetcher worker
+// — the same goroutine that pops. Waiting for a slot there deadlocks the whole
+// drain: with the queue full and every worker parked here, no one is left to
+// pop, so no slot can ever free and the session hangs until the drain watchdog
+// fires a misleading E9002. The overshoot is bounded by the number of hardlink
+// secondaries whose link failed, never by the plan size.
+//
+// It also accepts an item on a *closed* queue, and so cannot fail. close only
+// means "no new groups will be pushed"; pop keeps draining until the queue is
+// also empty with nothing in flight. Every caller runs while still holding an
+// item in flight, so pop cannot have returned ok=false yet and the appended
+// item is guaranteed to be served. Refusing here instead — which the first
+// version of this did — left the secondary absent from the destination for any
+// transfer long enough that decide finished ahead of fetch (MFR-0004 puts that
+// at ~20 minutes on a real tree), i.e. for the normal case.
+func (q *needQueue) pushFallback(it needItem) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.closed {
-		return errQueueClosed
-	}
 	q.items = append(q.items, it)
 	q.pushed++
 	q.pending[it.groupID]++
 	q.notEmpty.Broadcast()
-	return nil
 }
 
 // pop returns the next item. ok is false once the queue is drained: no items,

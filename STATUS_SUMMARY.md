@@ -57,7 +57,10 @@ The ROI-ordered write-up of everything still open is `ROI-fixes-Review-20260922.
   from `wire.ProtocolVersion` rather than a literal (REQ-CLI-008). Test
   `TestVersionIncludesProtocol`.
 
-Two defects were found and fixed *during* this pass rather than by it:
+Six defects were found and fixed *during* this pass rather than by it — four of
+them in the R-16 hardlink work alone, and three would have silently lost files.
+R-44 through R-47 came from a dedicated Opus review of the pass; it was the
+highest-value step in it.
 
 - **R-42 (NEW, `MED`, S) — drain deadlock introduced by the R-16 fallback.** The
   fetch-side fallback called the *blocking* `needQueue.pushGroup` from inside
@@ -74,6 +77,49 @@ Two defects were found and fixed *during* this pass rather than by it:
   builder that parses and validates without opening a listener, so `runSender` is
   a thin wrapper and no test-only state ships in the binary. The test is stronger
   for it: an unregistered flag now surfaces as a usage exit the helper fails on.
+- **R-44 (NEW, `HIGH`, S) — the R-16 fetch-side fallback was inert in the normal
+  case.** `pushFallback` refused a *closed* queue, and `run.go` closes it the
+  moment decide finishes — which MFR-0004 records as running ~20 minutes ahead of
+  fetch on a real tree. So for any non-trivial transfer the fallback returned
+  `errQueueClosed`, the secondary was counted `FilesFailed` and left absent from
+  the destination: the only change versus pre-fix was exit 1 instead of exit 0.
+  `close` means "no new groups", and every caller still holds an item in flight,
+  so `pop` cannot have given up — accepting is safe. Test
+  `TestQueuePushFallbackAfterCloseIsStillServed`. The existing
+  `TestFetchHardlinkFallsBackToContentOnLinkFailure` had passed only because it
+  enqueued *before* `q.close()`, which production never does; it now uses the
+  production ordering and fails on the pre-fix tree.
+- **R-45 (NEW, `HIGH`, S) — `hardlinkMap.clear` retired a key only halfway.** It
+  deleted `keyToPath` but left the `seen` bit, so after a link failure every
+  *later* entry sharing that key was parked by `claimSecondary` on a primary that
+  had already published and would never call `registerMaterialised` again: never
+  linked, never fetched, never counted — a hole in the destination on an exit-0
+  run. Three links to one inode plus one EMLINK/EEXIST is enough. `clear` now
+  retires path, seen bit and any parked secondaries (returned for fallback), and
+  the failing entry takes over as the key's primary. Test
+  `TestHardlinkClearRetiresTheKey`.
+- **R-46 (NEW, `MED`, S) — a permanently failed hardlink primary orphaned its
+  secondaries silently.** On retry-budget exhaustion `fetchOne` counts one
+  failure and returns; `registerMaterialised` is only reached from a successful
+  publish, so the parked secondaries stayed unlinked, unfetched and *uncounted*.
+  The run reported one failure while several files were missing. Added
+  `hardlinkMap.abandon`, which retires the key and hands back the orphans so each
+  is logged and counted. Test `TestHardlinkAbandonSurfacesOrphanedSecondaries`
+  (pre-fix proof is a compile failure — the method did not exist).
+- **R-47 (NEW, `MED`, S) — the two fallback paths disagreed.** Decide-side
+  reserved free space (§12.7) and grew the progress denominator; fetch-side did
+  neither, so a fallback wrote content past the one guard that exists for
+  unplanned content and could drive progress past 100 %. Both now run the same
+  `hlFallbackDeps.fetchInstead`. Asserted in
+  `TestFetchHardlinkFallsBackToContentOnLinkFailure`.
+
+The same review also narrowed R-23, which had over-corrected: the exit switch
+keyed on *every* walk skip, but E6006 (sockets, FIFOs, device nodes — advice text
+"expected; these are never transferred") and E6007 (symlink cycle) are `Warn`
+class, and §14.6 says `Warn` does not affect the exit code. `esync ~/` over any
+tree holding one socket exited 1 on a byte-perfect run. `walkTree` now returns the
+E6005-only count separately and only that reaches the exit decision. Test
+`sender.TestWalkSkipUnreadableCountIsE6005Only`.
 
 ---
 

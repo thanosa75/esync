@@ -115,6 +115,15 @@ The followed-directory descent lacks the `st_dev` check that `walk.go:94-98` app
 ### B8 · R-36 — receiver never emits FILE_CANCEL · `MED` · M *(downgraded)*
 Message `0x35` and the sender's handler both exist; no receiver path sends it, so §9.4's INV-3 is vacuous. **This dropped in priority this pass:** the R-39 desync fix removed the correctness need for it, and `serve()` runs synchronously inside `run()`, so the sender cannot read a cancel mid-stream anyway. It is now tidiness plus a small bandwidth win on abandoned transfers — and the MEMORY.md note calling it "WONTFIX, needs a wire message" is stale and should be corrected whichever way this goes.
 
+### B8b · A hostile peer picks the sender's exit code and injects raw text into its log · `MED` · S · *(from the 2026-09-23 Opus review)*
+`sender/run.go` `peerError` maps the peer's `Error.Code` straight through `fault.Code(fmt.Sprintf("E%04d", …))`. Nothing is unsafe — an uncatalogued code falls back to `{class: Fatal}` and exit 2, and `e.Code` is a `u16` — but a peer sending `1001` makes the sender exit **3 ("usage error")** and `2001` exit **4 ("pairing/auth")**, so the peer chooses the operator-visible failure category. `Message` and `Detail` are peer-controlled strings up to 64 KiB each, unsanitised and concatenated into a fault written to stderr: newline and ANSI injection into the operator's log. The receiver's mirror has the same shape minus `Detail`, so the pattern predates this pass, but the sender half is new. **Do:** accept only catalogued codes (unknown → E5001), and truncate + escape the peer text. While there, fold the two near-duplicate `peerError`s together — they format the code differently (`fmt.Sprintf("E%04d")` vs `pad4`).
+
+### B8c · `MaxCTControl` was raised without a `ProtocolVersion` bump · `LOW` · S · *(from the 2026-09-23 Opus review)*
+R-13 raised the control-record ceiling to 512 KiB while `wire.ProtocolVersion` stayed `0x02`, and `doc/ARCHITECTURE.md` §8 asserts "sender and receiver read the same constant, so this is not a cross-version wire break" — true only for same-build peers. An old 0x02 receiver pairs happily with a new 0x02 sender and then rejects any GROUP_MANIFEST record over 256 KiB. Not a regression (old+old failed too — that *was* R-13), but the doc claim is wrong, and by this project's own precedent (MFR-0006 bumped the version for a grouping change) a wire-ceiling change is version-bump material. Bundle with B5.
+
+### B8d · A content-fallback hardlink secondary is double-counted · `LOW` · S · *(from the 2026-09-23 Opus review)*
+A parked secondary returns `need=false` from `decideFile`, so it counts into `GROUP_DECISION.SkippedCount` *and* `FilesSkipped`; if a fallback later fetches it, it also counts `FilesTransferred`. The receiver summary then has `Transferred + Skipped + Failed > FilesTotal`. Harmless today — the only cross-check is the completion digest, which matches on both sides — but it should be decided deliberately rather than by accident.
+
 ### B9 · Numeric flag validation does not exist · `LOW–MED` · S
 §16 claims every numeric flag is range-validated to E1007. False for all duration flags and two ints; `withDefaults` (`receiver/config.go:69-110`) silently re-defaults negatives, so `--stall-timeout=-5` is accepted and ignored. Validate, or reword the invariant. Validating is barely more work and is the better answer.
 
@@ -126,6 +135,12 @@ Codec-only (`wire/msgtype.go:29`, `frame.go:178`); no sender emit site, and a re
 
 ### B12 · PING/PONG RTT never reaches the tuner · `LOW` · M
 Keepalive is liveness-only (`channel/channel.go:192-243`); `tune.go` uses goodput plus error counters. §9.2/§13.4's "RTT measurement feeding the tuner" over-promises. Either wire RTT in or scrub the claim; the tuner works without it, so this is honesty-first.
+
+---
+
+### B13 · Test-quality gaps the review flagged · `LOW` · S each · *(from the 2026-09-23 Opus review)*
+- `TestCompactEndpoints` asserts the mechanism (truncate to 2, WARN present) rather than the point of R-19, which is `REQ-PAIR-002`'s 64-character budget. `paircode.Encode` the result and assert `len(code) <= 64`. It also does not prove `Run` calls it (`run.go:138` is untested), though `TestRunSenderCompactCode` covers flag → Config.
+- `TestRealisticWorstCaseGroupFitsControlRecord` is the model to copy — 4095-byte paths through the real `wire.Marshal` and a real `record.Writer`. Gap: uniform path lengths, no symlink or hardlink-key entries in the worst case.
 
 ---
 

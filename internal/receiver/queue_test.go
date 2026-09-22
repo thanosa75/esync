@@ -227,15 +227,13 @@ func TestQueuePushFallbackNeverBlocksWhenFull(t *testing.T) {
 		t.Fatalf("depth = %d, want 1 (queue must be at capacity for this test to mean anything)", got)
 	}
 
-	done := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		done <- q.pushFallback(needItem{fileID: 2, groupID: 7, size: 10, rel: "b"})
+		q.pushFallback(needItem{fileID: 2, groupID: 7, size: 10, rel: "b"})
+		close(done)
 	}()
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("pushFallback on a full queue: %v", err)
-		}
+	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("pushFallback blocked on a full queue; it is called from the popping goroutine, so this deadlocks the drain")
 	}
@@ -251,5 +249,41 @@ func TestQueuePushFallbackNeverBlocksWhenFull(t *testing.T) {
 	q.close()
 	if q.drained() {
 		t.Error("drained() is true with a fallback item still queued")
+	}
+}
+
+// TestQueuePushFallbackAfterCloseIsStillServed pins the other half of
+// pushFallback's contract. run.go closes the queue the moment decide finishes,
+// and decide runs far ahead of fetch (MFR-0004 observed ~20 minutes), so a
+// hardlink secondary whose link fails during the fetch phase is almost always
+// enqueued *after* close. Refusing it there leaves the file absent from the
+// destination — the exact R-16 hole — so close, which only means "no new
+// groups", must not reject it. The caller always holds an item in flight, so
+// pop cannot have given up yet and the item is guaranteed to be served.
+func TestQueuePushFallbackAfterCloseIsStillServed(t *testing.T) {
+	q := newNeedQueue(4)
+	if err := q.pushGroup(context.Background(), []needItem{{fileID: 1, groupID: 3, size: 10, rel: "a"}}); err != nil {
+		t.Fatalf("pushGroup: %v", err)
+	}
+	ctx := context.Background()
+	primary, ok := q.pop(ctx) // in flight, as a fetcher worker would be
+	if !ok {
+		t.Fatal("pop returned no item")
+	}
+	q.close()
+
+	q.pushFallback(needItem{fileID: 2, groupID: 3, size: 10, rel: "b"})
+	q.done(primary.groupID)
+
+	got, ok := q.pop(ctx)
+	if !ok {
+		t.Fatal("pop returned nothing: the fallback was dropped on a closed queue, so the secondary would be missing from the destination")
+	}
+	if got.fileID != 2 {
+		t.Fatalf("popped file %d, want the fallback item 2", got.fileID)
+	}
+	q.done(got.groupID)
+	if !q.drained() {
+		t.Error("queue should be drained once the fallback is resolved")
 	}
 }
